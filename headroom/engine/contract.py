@@ -31,6 +31,7 @@ class RequestContext:
     headers_view: Mapping[str, str]
     raw_body: bytes
     session_key: str
+    request_id: str = ""
 
     def __post_init__(self) -> None:
         # Snapshot headers at the engine boundary: copy to isolate from later caller
