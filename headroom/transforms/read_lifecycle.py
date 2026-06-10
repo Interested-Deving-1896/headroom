@@ -11,6 +11,13 @@ Real-world data shows 75% of Read output bytes fall into these two categories:
 - 67% stale (file edited after Read)
 - 12% superseded (file re-Read later)
 - Only 20% are fresh (untouched)
+
+A third, cache-safe mechanism handles repeat Reads at first sight: when a
+NEW Read returns content byte-identical to an earlier Read of the same file
+still in context, the NEW copy is replaced with a pointer marker
+(DEDUP_REPEAT). Unlike compress_superseded — which mutates the older,
+provider-cached copy and busts the prefix cache — the new copy sits at the
+conversation tail and has never been cache-written, so this is free.
 """
 
 from __future__ import annotations
@@ -38,6 +45,12 @@ class ReadState(str, Enum):
     FRESH = "fresh"  # Latest read, no subsequent edit — leave untouched
     STALE = "stale"  # File was edited after this Read — content is wrong
     SUPERSEDED = "superseded"  # File was re-Read after this Read — content is redundant
+    # A NEW Read whose content is byte-identical to an earlier Read of the
+    # same file still in context. The NEW copy is replaced with a pointer;
+    # the earlier copy keeps the verbatim bytes. Cache-safe by construction:
+    # the new copy is at the conversation tail and has never been
+    # cache-written.
+    DEDUP_REPEAT = "dedup_repeat"
 
 
 @dataclass
@@ -84,6 +97,7 @@ class ReadLifecycleResult:
     reads_stale: int = 0
     reads_superseded: int = 0
     reads_fresh: int = 0
+    reads_dedup_repeat: int = 0
     bytes_before: int = 0
     bytes_after: int = 0
     transforms_applied: list[str] = field(default_factory=list)
@@ -127,8 +141,16 @@ class ReadLifecycleManager:
         tool_metadata = self._build_tool_metadata(messages)
         file_ops = self._build_file_operation_index(messages, tool_metadata)
 
+        # Phase 1b: Collect Read result contents for repeat-Read dedup
+        read_contents: dict[str, str] = {}
+        if self.config.dedup_repeat_reads:
+            read_ids = {
+                op.tool_call_id for ops in file_ops.values() for op in ops if op.operation == "read"
+            }
+            read_contents = self._build_read_contents(messages, read_ids)
+
         # Phase 2: Classify each Read
-        classifications = self._classify_reads(file_ops)
+        classifications = self._classify_reads(file_ops, read_contents)
 
         if not classifications:
             return ReadLifecycleResult(messages=messages)
@@ -284,6 +306,41 @@ class ReadLifecycleManager:
         return None
 
     @staticmethod
+    def _build_read_contents(messages: list[dict[str, Any]], read_ids: set[str]) -> dict[str, str]:
+        """Collect tool_result content strings for Read tool calls.
+
+        Handles both OpenAI (role=tool messages) and Anthropic
+        (tool_result content blocks) formats. Only string content is
+        collected — structured content can't be byte-compared.
+        """
+        contents: dict[str, str] = {}
+        if not read_ids:
+            return contents
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # OpenAI format
+            if role == "tool":
+                tc_id = msg.get("tool_call_id", "")
+                if tc_id in read_ids and isinstance(content, str):
+                    contents[tc_id] = content
+                continue
+
+            # Anthropic format
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    tc_id = block.get("tool_use_id", "")
+                    block_content = block.get("content", "")
+                    if tc_id in read_ids and isinstance(block_content, str):
+                        contents[tc_id] = block_content
+
+        return contents
+
+    @staticmethod
     def _read_covers(later: FileOperation, earlier: FileOperation) -> bool:
         """Check if `later` read fully covers the line range of `earlier`.
 
@@ -306,8 +363,12 @@ class ReadLifecycleManager:
 
         return later_start <= earlier_start and later_end >= earlier_end
 
-    def _classify_reads(self, file_ops: dict[str, list[FileOperation]]) -> list[ReadClassification]:
-        """Classify each Read as fresh, stale, or superseded."""
+    def _classify_reads(
+        self,
+        file_ops: dict[str, list[FileOperation]],
+        read_contents: dict[str, str] | None = None,
+    ) -> list[ReadClassification]:
+        """Classify each Read as fresh, stale, superseded, or dedup_repeat."""
         classifications: list[ReadClassification] = []
 
         for file_path, ops in file_ops.items():
@@ -317,6 +378,7 @@ class ReadLifecycleManager:
             if not reads:
                 continue
 
+            per_file: list[tuple[FileOperation, ReadClassification]] = []
             for read_op in reads:
                 # Check stale: any edit/write of this file AFTER this read?
                 is_stale = self.config.compress_stale and any(
@@ -339,15 +401,41 @@ class ReadLifecycleManager:
                 else:
                     state = ReadState.FRESH
 
-                classifications.append(
-                    ReadClassification(
-                        msg_index=read_op.msg_index,
-                        tool_call_id=read_op.tool_call_id,
-                        file_path=file_path,
-                        state=state,
-                        content_size=read_op.content_size,
-                    )
+                classification = ReadClassification(
+                    msg_index=read_op.msg_index,
+                    tool_call_id=read_op.tool_call_id,
+                    file_path=file_path,
+                    state=state,
+                    content_size=read_op.content_size,
                 )
+                per_file.append((read_op, classification))
+                classifications.append(classification)
+
+            # Repeat-Read dedup pass: a LATER fresh read whose content is
+            # byte-identical to an EARLIER fresh read of the same file
+            # becomes DEDUP_REPEAT (the new copy points at the old one).
+            # Both sides must be FRESH: a stale earlier copy is about to
+            # be replaced and can't serve as the pointer target, and a
+            # stale later copy is already handled by the stale path.
+            # Identical content also implies identical staleness for
+            # full-file reads, so the FRESH/FRESH requirement costs
+            # nothing in practice.
+            if self.config.dedup_repeat_reads and read_contents and len(per_file) >= 2:
+                per_file.sort(key=lambda pair: pair[0].msg_index)
+                for i, (later_op, later_cls) in enumerate(per_file):
+                    if later_cls.state != ReadState.FRESH:
+                        continue
+                    later_content = read_contents.get(later_op.tool_call_id)
+                    if not later_content or (
+                        len(later_content.encode("utf-8")) < self.config.min_size_bytes
+                    ):
+                        continue
+                    for earlier_op, earlier_cls in per_file[:i]:
+                        if earlier_cls.state != ReadState.FRESH:
+                            continue
+                        if read_contents.get(earlier_op.tool_call_id) == later_content:
+                            later_cls.state = ReadState.DEDUP_REPEAT
+                            break
 
         return classifications
 
@@ -374,7 +462,7 @@ class ReadLifecycleManager:
         ccr_hashes: list[str] = []
         bytes_before = 0
         bytes_after = 0
-        counts = {ReadState.FRESH: 0, ReadState.STALE: 0, ReadState.SUPERSEDED: 0}
+        counts = dict.fromkeys(ReadState, 0)
 
         for c in classifications:
             counts[c.state] += 1
@@ -415,6 +503,7 @@ class ReadLifecycleManager:
             reads_stale=counts[ReadState.STALE],
             reads_superseded=counts[ReadState.SUPERSEDED],
             reads_fresh=counts[ReadState.FRESH],
+            reads_dedup_repeat=counts[ReadState.DEDUP_REPEAT],
             bytes_before=bytes_before,
             bytes_after=bytes_after,
             transforms_applied=transforms,
@@ -486,14 +575,25 @@ class ReadLifecycleManager:
 
         file_display = classification.file_path or "unknown"
 
+        # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
+        # the compression-pinning checks in ContentRouter and the
+        # marker-preserving regex in compression_units.py match on it.
         if classification.state == ReadState.STALE:
             marker = (
-                f"[Read content stale: {file_display} was modified after this read. "
+                f"[Read content stale: {file_display} was modified after this read — "
+                f"re-read the file for current content. "
+                f"Retrieve original: hash={ccr_hash}]"
+            )
+        elif classification.state == ReadState.DEDUP_REPEAT:
+            marker = (
+                f"[Read of {file_display}: content is byte-identical to the earlier "
+                f"read of this file above — see that read for the full content. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
         else:  # SUPERSEDED
             marker = (
-                f"[Read content superseded: {file_display} was re-read later. "
+                f"[Read content superseded: {file_display} was re-read later — "
+                f"re-read the file if needed. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
 

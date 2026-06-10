@@ -623,9 +623,12 @@ class HeadroomProxy(
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
             router_config.exclude_tools = set(DEFAULT_EXCLUDE_TOOLS) | config.exclude_tools
-        # Token mode: allow compression of older excluded-tool results.
+        # Token mode: allow compression of older excluded-tool results,
+        # and emit search results grouped by file (path once per file
+        # instead of repeated on every match line).
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
+            router_config.search_group_by_file = True
         # `--compress-user-messages` flips the router's default skip rule.
         # Off by default for prefix-cache safety; enabled for workloads where
         # user-message content dominates input (OpenAI/Azure chat with pasted
@@ -2970,6 +2973,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
         if query:
+            if not store.exists(hash_key, clean_expired=True):
+                raise HTTPException(
+                    status_code=404,
+                    detail=format_retrieval_miss_detail(
+                        store.get_entry_status(hash_key, clean_expired=True)
+                    ),
+                )
             # Search within cached content
             results = store.search(hash_key, query)
             return {
