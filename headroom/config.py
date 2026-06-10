@@ -254,15 +254,6 @@ class ReadLifecycleConfig:
     compress_superseded: bool = False  # Disabled: busts Anthropic prompt cache prefix
     min_size_bytes: int = 512  # Skip tiny Read outputs (not worth the overhead)
 
-    # First-sight dedup of repeat Reads: when a NEW Read's content is
-    # byte-identical to an earlier Read of the same file still in context,
-    # replace the NEW copy with a pointer marker. Provably lossless (the
-    # bytes exist verbatim earlier in the conversation) and cache-safe by
-    # construction: the new copy sits at the tail of the conversation and
-    # has never been cache-written, so no provider prefix is invalidated —
-    # unlike compress_superseded, which mutates the (cached) older copy.
-    dedup_repeat_reads: bool = True
-
 
 @dataclass
 class CompressionProfile:

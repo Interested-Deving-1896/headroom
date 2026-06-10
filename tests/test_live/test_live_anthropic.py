@@ -14,8 +14,6 @@ import os
 import httpx
 import pytest
 
-from headroom.config import ReadLifecycleConfig
-from headroom.transforms.read_lifecycle import ReadLifecycleManager
 from headroom.transforms.search_compressor import SearchCompressor, SearchCompressorConfig
 
 pytestmark = pytest.mark.skipif(
@@ -85,28 +83,7 @@ def read_roundtrip(tc_id: str, content: str) -> list[dict]:
     ]
 
 
-class TestDedupMarkerLive:
-    def test_model_answers_from_earlier_copy_via_pointer(self):
-        """A repeat Read replaced by a dedup pointer: the model must answer
-        from the verbatim earlier copy the pointer references."""
-        messages = [{"role": "user", "content": "Read /src/magic.py please"}]
-        messages += read_roundtrip("toolu_r1", FILE_CONTENT)
-        messages += [{"role": "user", "content": "Now read it again to double-check."}]
-        messages += read_roundtrip("toolu_r2", FILE_CONTENT)
-
-        res = ReadLifecycleManager(ReadLifecycleConfig()).apply(messages)
-        assert res.reads_dedup_repeat == 1, "fixture must trigger dedup"
-
-        res.messages.append(
-            {
-                "role": "user",
-                "content": "Based on the file contents: what number does answer() return? "
-                "Reply with just the number.",
-            }
-        )
-        reply = call_anthropic(res.messages)
-        assert "42" in reply, f"model failed to answer from deduped context: {reply!r}"
-
+class TestLifecycleMarkerLive:
     def test_api_accepts_stale_marker_shape(self):
         """A stale-Read marker (file edited after read) must be a valid
         message body and not confuse the model into inventing content."""
