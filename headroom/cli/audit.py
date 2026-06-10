@@ -28,7 +28,16 @@ from .main import main
     help="Also simulate Mechanism B (read maturation): re-read rates, "
     "never-touched-again share, quiesce-window coverage, at-risk edits.",
 )
-def audit_reads_cmd(root: Path | None, output_format: str, simulate_maturation: bool) -> None:
+@click.option(
+    "--codex",
+    "codex_mode",
+    is_flag=True,
+    help="Audit Codex transcripts instead (shell-based reads: cat/sed/rtk read). "
+    "Default path becomes ~/.codex/sessions.",
+)
+def audit_reads_cmd(
+    root: Path | None, output_format: str, simulate_maturation: bool, codex_mode: bool
+) -> None:
     """Audit Read-tool traffic for compression opportunities.
 
     Streams local Claude Code transcripts (read-only) and sizes the
@@ -44,8 +53,29 @@ def audit_reads_cmd(root: Path | None, output_format: str, simulate_maturation: 
     Examples:
         headroom audit-reads
         headroom audit-reads --path /var/transcripts --format json
+        headroom audit-reads --codex
     """
+    import json as _json
+
     from headroom.audit.reads import audit_reads, render_text
+
+    if codex_mode:
+        if root is None:
+            root = Path.home() / ".codex" / "sessions"
+            if not root.exists():
+                raise click.ClickException(
+                    f"{root} does not exist — pass --path to the Codex sessions directory"
+                )
+        from headroom.audit.codex import audit_codex, render_codex_text
+
+        codex_report = audit_codex(root)
+        if codex_report.sessions == 0:
+            raise click.ClickException(f"no *.jsonl transcripts found under {root}")
+        if output_format == "json":
+            click.echo(_json.dumps(codex_report.to_dict(), indent=2, sort_keys=True))
+        else:
+            click.echo(render_codex_text(codex_report))
+        return
 
     if root is None:
         root = Path.home() / ".claude" / "projects"
@@ -66,8 +96,6 @@ def audit_reads_cmd(root: Path | None, output_format: str, simulate_maturation: 
         sim = run_sim(root)
 
     if output_format == "json":
-        import json as _json
-
         data = _json.loads(report.to_json())
         if sim is not None:
             data["maturation_simulation"] = sim.to_dict()
