@@ -28,9 +28,9 @@ class Finding:
     line: int
     message: str
 
-    def render(self) -> str:
+    def render(self, root: Path = ROOT) -> str:
         try:
-            rel = self.path.relative_to(ROOT)
+            rel = self.path.relative_to(root)
         except ValueError:
             rel = self.path
         return f"{rel}:{self.line}: {self.rule}: {self.message}"
@@ -96,6 +96,16 @@ class BackendMessagePreservationRule:
         findings: list[Finding] = []
         for rel in self.paths:
             path = root / rel
+            if not path.exists():
+                findings.append(
+                    Finding(
+                        self.id,
+                        path,
+                        1,
+                        f"expected backend file not found: {rel}",
+                    )
+                )
+                continue
             tree = _parse(path)
             source = _read(path)
             if "preserve_message_fields" not in source:
@@ -425,7 +435,7 @@ def main() -> int:
     if findings:
         print("Headroom architectural guardrails failed:")
         for finding in findings:
-            print(f"  {finding.render()}")
+            print(f"  {finding.render(root)}")
         return 1
     print(f"Headroom architectural guardrails passed ({len(RULES)} rules).")
     return 0
