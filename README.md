@@ -91,7 +91,8 @@ pip install "headroom-ai[all]"          # Python
 npm install headroom-ai                 # Node / TypeScript
 
 # 2 — Pick your mode
-headroom wrap claude                    # wrap a coding agent
+headroom wrap claude                    # wrap a coding agent (just this session)
+headroom install apply                  # always-on: install as a background service (every session)
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
 
@@ -100,6 +101,8 @@ headroom doctor                         # health check — confirms routing is w
 headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
+
+**`wrap` vs `install apply`:** `headroom wrap` compresses the session it launches. `headroom install apply` installs Headroom as an always-on background service (launchd/systemd) and points your tools at the local proxy, so **every** session is compressed automatically — across restarts, no re-wrapping. Inspect it with `headroom install status`; undo it (service + config) with `headroom install remove`.
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
