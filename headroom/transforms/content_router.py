@@ -758,7 +758,6 @@ class ContentRouterConfig:
         enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
         enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over Kompress for code.
-        mixed_content_threshold: Min distinct types to consider "mixed".
         min_section_tokens: Minimum tokens for a section to compress.
         fallback_strategy: Strategy when no compressor matches.
         skip_user_messages: Never compress user messages (they're the subject).
@@ -788,7 +787,6 @@ class ContentRouterConfig:
     # emits a `<<ccr:…>>` / `Retrieve …` retrieval marker. SmartCrusher is
     # additionally forced marker-free via smart_crusher_lossless_only.
     lossless: bool = False
-    mixed_content_threshold: int = 2  # Min types to consider mixed
     min_section_tokens: int = 20  # Min tokens to compress a section
 
     # Fallback: Kompress handles unknown/mixed content instead of passing through
@@ -835,12 +833,18 @@ class ContentRouterConfig:
         0.0  # 0.0 = protect ALL excluded-tool outputs (safest for coding agents)
     )
 
-    # Adaptive compression ratio: scales with context pressure.
-    # At low pressure (<30% full), use the relaxed threshold (reject marginal).
-    # At high pressure (>80% full), use the aggressive threshold (accept anything helpful).
-    # Linearly interpolates between the two.
-    min_ratio_relaxed: float = 0.85  # when context is mostly empty
-    min_ratio_aggressive: float = 0.65  # when context is nearly full
+    # Adaptive acceptance threshold, scaling with context pressure. The gate
+    # accepts a compression when compression_ratio < min_ratio (ratio =
+    # compressed/original, so LOWER ratio = bigger savings). Thus a HIGHER
+    # min_ratio is MORE lenient (accepts marginal wins) and a LOWER one is
+    # stricter (only big wins clear it). min_ratio is interpolated
+    # 0.85 (empty context) -> 0.65 (full), i.e. acceptance gets STRICTER as
+    # context fills, so only large savings justify busting the prefix cache
+    # under pressure. (Direction is deliberate; whether a full context should
+    # instead accept *more* to reclaim space is a design question flagged for
+    # an eval — do not flip without measuring.)
+    min_ratio_relaxed: float = 0.85  # low pressure: lenient, accept marginal wins
+    min_ratio_aggressive: float = 0.65  # high pressure: strict, big wins only
 
     # CCR (Compress-Cache-Retrieve) settings for SmartCrusher
     ccr_enabled: bool = True  # Enable CCR marker injection for reversible compression
@@ -3598,6 +3602,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="tool_result",
                         details_prefix="tool",
+                        enforce_reversibility=True,
                     )
                     if compressed_content is not None:
                         new_blocks.append({**block, "content": compressed_content})
@@ -3674,6 +3679,7 @@ class ContentRouter(Transform):
         compressed_details: list[str] | None,
         strategy_label: str,
         details_prefix: str,
+        enforce_reversibility: bool = False,
     ) -> tuple[str | None, bool]:
         """Apply two-tier cache lookup + compression to a single content string.
 
@@ -3738,6 +3744,23 @@ class ContentRouter(Transform):
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
         if result.compression_ratio < min_ratio:
+            # Tool ground truth must stay reversible: a lossy summarizer
+            # (kompress/text/code) that emitted no CCR retrieve marker is
+            # unrecoverable, so the agent would act on a fabricated summary
+            # (#1307). The string/`role=="tool"` path guards this; mirror it
+            # here for tool_result blocks (never cached, so the Tier-2 path
+            # above can't serve a poisoned entry).
+            if (
+                enforce_reversibility
+                and result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
+                and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+            ):
+                self._cache.mark_skip(content_key)
+                if route_counts is not None:
+                    route_counts["lossy_unrecoverable_skipped"] = (
+                        route_counts.get("lossy_unrecoverable_skipped", 0) + 1
+                    )
+                return None, False
             # Compressed — store in result cache
             self._cache.put(
                 content_key,
