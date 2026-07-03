@@ -859,10 +859,16 @@ class ContentRouterConfig:
     # `relevance` below; high-relevance records are kept verbatim and the
     # low-relevance tail is Kompressed. Works in both modes: in lossless mode
     # the tail is marker-free; in CCR mode it carries a retrieval marker (via
-    # ccr_inject_marker) so dropped detail stays retrievable. Off by default:
-    # a new hot-path ML step, gated like Kompress/CacheAligner.
-    relevance_split: bool = False
+    # ccr_inject_marker) so dropped detail stays retrievable. On by default; the
+    # embedding model is pre-warmed in the background (BM25 scores until it's
+    # cached) so no request ever blocks on the download.
+    relevance_split: bool = True
     relevance: RelevanceScorerConfig = field(default_factory=RelevanceScorerConfig)
+    # Optional latency guard: skip the split when an output segments into more
+    # than this many records, capping embedding work on the request thread.
+    # 0 = no cap (default): every record is scored regardless of size. Set a
+    # positive value to bound per-request embedding cost on very large outputs.
+    relevance_max_records: int = 0
 
     # Tag protection: preserve custom/workflow XML tags from text compression.
     # When False (default), entire <custom-tag>content</custom-tag> blocks are
@@ -1174,6 +1180,7 @@ class ContentRouter(Transform):
         # via _relevance_scorer_tried so a failed load isn't retried per call).
         self._relevance_scorer: Any = None
         self._relevance_scorer_tried: bool = False
+        self._relevance_prewarm_started: bool = False
         # tool_call_id → compact args text, populated by _build_tool_name_map.
         self._tool_call_args: dict[str, str] = {}
 
@@ -2172,23 +2179,55 @@ class ContentRouter(Transform):
         return self._log_compressor
 
     def _get_relevance_scorer(self) -> Any:
-        """Get the relevance scorer for the Stage B split (lazy, cached).
+        """Get the relevance scorer for the split (lazy, cached, non-blocking).
 
-        Tier comes from ``config.relevance``; hybrid/embedding degrade to BM25
-        when fastembed isn't installed. Returns None (once, cached) on any
-        failure so callers fall back to the plain lossless path. Never raises.
+        Tier comes from ``config.relevance``. For ``bm25`` this is instant. For
+        ``hybrid``/``embedding`` the scorer serves **BM25 immediately** and the
+        embedding model is warmed in a background thread; once it's cached the
+        scorer is swapped in (GIL-atomic ref write), so a request never blocks
+        on the ~30MB download. Returns None (cached) on failure. Never raises.
         """
         if self._relevance_scorer is not None or self._relevance_scorer_tried:
             return self._relevance_scorer
         self._relevance_scorer_tried = True
+        tier = (self.config.relevance.tier or "hybrid").lower()
         try:
-            from ..relevance import create_scorer
+            from ..relevance import BM25Scorer
 
-            self._relevance_scorer = create_scorer(self.config.relevance.tier)
+            if tier == "bm25":
+                self._relevance_scorer = BM25Scorer()
+            else:
+                # Serve BM25 now; swap to the embedding-backed scorer once warm.
+                self._relevance_scorer = BM25Scorer()
+                self._start_relevance_prewarm(tier)
         except Exception as exc:  # noqa: BLE001
             logger.debug("relevance scorer unavailable: %s", exc)
             self._relevance_scorer = None
         return self._relevance_scorer
+
+    def _start_relevance_prewarm(self, tier: str) -> None:
+        """Warm the embedding model off the request thread, then swap it in.
+
+        Idempotent. On failure (fastembed missing, download error) the router
+        just stays on the BM25 scorer set by ``_get_relevance_scorer``.
+        """
+        if getattr(self, "_relevance_prewarm_started", False):
+            return
+        self._relevance_prewarm_started = True
+
+        def _warm() -> None:
+            try:
+                from ..relevance import create_scorer
+
+                scorer = create_scorer(tier)
+                # Force the model download+load and a first embed here, in the
+                # background — so the first real request finds it warm.
+                scorer.score_batch(["warmup"], "warmup")
+                self._relevance_scorer = scorer  # GIL-atomic ref swap
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("relevance model prewarm failed; staying on BM25: %s", exc)
+
+        threading.Thread(target=_warm, name="relevance-prewarm", daemon=True).start()
 
     def _relevance_split_compress(self, content: str, kind: str, query: str) -> str | None:
         """Prompt-conditioned KEEP/DROP split for the compression tail.
@@ -2201,9 +2240,10 @@ class ContentRouter(Transform):
         normal path when the scorer is unavailable, the query is empty, nothing
         is dropped, or the split doesn't beat plain compaction. Never raises.
 
-        ponytail: embeds one vector per record — O(records) on the request
-        thread. Contained today by opt-in gating; add a record cap / background
-        pre-warm if this goes default-on.
+        Embedding cost is bounded two ways: the model is pre-warmed off the
+        request thread (BM25 until it's ready, see _get_relevance_scorer) and
+        outputs segmenting into more than ``relevance_max_records`` records skip
+        the split entirely.
         """
         scorer = self._get_relevance_scorer()
         if scorer is None or not query.strip():
@@ -2216,6 +2256,7 @@ class ContentRouter(Transform):
                 query,
                 scorer,
                 threshold=self.config.relevance.relevance_threshold,
+                max_records=self.config.relevance_max_records,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("relevance split failed (%s); falling back", exc)

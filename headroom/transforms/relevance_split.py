@@ -98,6 +98,7 @@ def plan_relevance_split(
     threshold: float,
     window: int = 8,
     max_chars: int = 1200,
+    max_records: int | None = None,
 ) -> list[tuple[bool, str]]:
     """Split ``content`` into ordered ``(keep, text)`` runs by relevance to ``query``.
 
@@ -106,13 +107,14 @@ def plan_relevance_split(
     ranges from 0% to 100% with the actual content, not a fixed quota.
     Consecutive same-disposition records are merged into runs (order
     preserved) so the caller applies one disposition per run. Returns a single
-    KEEP run -- i.e. no split -- when the query is empty or the content is a
-    single record, letting the caller fall back to its non-split path.
+    KEEP run -- i.e. no split -- when the query is empty, the content is a
+    single record, or it segments into more than ``max_records`` records (a
+    latency guard on the scoring cost), letting the caller fall back.
     """
     if not query.strip():
         return [(True, content)]
     segs = segment(content, window=window, max_chars=max_chars)
-    if len(segs) < 2:
+    if len(segs) < 2 or (max_records and len(segs) > max_records):
         return [(True, content)]
 
     scores = scorer.score_batch(segs, query)

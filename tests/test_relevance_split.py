@@ -151,7 +151,24 @@ def test_router_diff_stays_pure_lossless():
     assert chain == ["lossless_diff"]
 
 
-def test_router_split_off_by_default_is_unchanged():
+def test_router_split_can_be_disabled():
     r = _router(split_on=False)
     _, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
     assert "relevance_split" not in chain
+
+
+def test_relevance_split_on_by_default_and_non_blocking():
+    from headroom.relevance.bm25 import BM25Scorer
+
+    r = ContentRouter(ContentRouterConfig())
+    assert r.config.relevance_split is True
+    # Even with the default hybrid tier, the hot-path scorer is served
+    # synchronously as BM25 — the embedding model warms in the background, so a
+    # request never blocks on the ~30MB download.
+    assert isinstance(r._get_relevance_scorer(), BM25Scorer)
+
+
+def test_split_respects_max_records_cap():
+    content = "".join(f"rec {i} widget\n\n" for i in range(10))  # 10 blank-sep records
+    runs = plan_relevance_split(content, "widget", KeywordScorer(), threshold=0.5, max_records=3)
+    assert runs == [(True, content)]  # over the cap → no split, caller falls back
