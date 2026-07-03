@@ -3410,7 +3410,23 @@ class ContentRouter(Transform):
                     compressor_timing.get(strategy_key, 0.0) + compress_ms
                 )
 
-                if result.compression_ratio < min_ratio:
+                # Lossless folds (search/log/diff via compact_lossless) shrink
+                # BYTES by collapsing repeated path prefixes, but the word-count
+                # ratio barely moves — a heading line can even push it >1.0 — so
+                # the word-count gate would discard a free, byte-recoverable win.
+                # Measure lossless results by byte ratio (the real saving). The
+                # excluded/bash paths already bypass this gate; this fixes the
+                # main strategy dispatch.
+                is_lossless = any(
+                    s.startswith("lossless_")
+                    for s in (getattr(result, "strategy_chain", None) or [])
+                )
+                accept_ratio = (
+                    len(result.compressed) / len(result.original)
+                    if is_lossless and getattr(result, "original", None)
+                    else result.compression_ratio
+                )
+                if accept_ratio < min_ratio:
                     # tool ground truth must stay reversible — a lossy summarizer
                     # (kompress/text/code) that emitted no CCR retrieve marker is
                     # unrecoverable, so the agent would act on a fabricated summary
@@ -3433,7 +3449,7 @@ class ContentRouter(Transform):
                     self._cache.put(
                         content_key,
                         result.compressed,
-                        result.compression_ratio,
+                        accept_ratio,
                         result.strategy_used.value,
                     )
                     if netcost_enabled and not self._net_cost_allows(
@@ -3450,11 +3466,9 @@ class ContentRouter(Transform):
                         continue
                     result_slots[slot_idx] = {**message, "content": result.compressed}
                     transforms_applied.append(
-                        f"router:{result.strategy_used.value}:{result.compression_ratio:.2f}"
+                        f"router:{result.strategy_used.value}:{accept_ratio:.2f}"
                     )
-                    compressed_details.append(
-                        f"{result.strategy_used.value}:{result.compression_ratio:.2f}"
-                    )
+                    compressed_details.append(f"{result.strategy_used.value}:{accept_ratio:.2f}")
                     if slot_idx in frozen_unlock_slots:
                         transforms_applied.append("router:netcost_frozen_unlock")
                         route_counts.setdefault("netcost_frozen_unlocked", 0)
