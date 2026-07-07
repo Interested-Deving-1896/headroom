@@ -320,13 +320,28 @@ class AnthropicHandlerMixin:
         Safe means the prior original request is an exact message-prefix of the
         current original request. This lets us replay the exact forwarded bytes
         for historical context and only transform newly appended message suffixes.
+
+        The prefix equality check ignores ``cache_control``: clients (litellm,
+        Claude Code) move the ephemeral cache breakpoint to the newest message
+        on every turn, so a historical message carries the marker on one turn and
+        not the next. Comparing raw dicts makes that per-call annotation fail the
+        prefix match, dropping cache mode to raw (uncompressed) forwarding every
+        turn -- byte-stable but 0% compression (observed: avg_compression_pct=0.0
+        on the mini-swe-agent cache-mode run). The marker never changes message
+        *content*, so stripping it for the compare lets the delta path engage:
+        replay the byte-identical cached prefix AND compress only the appended
+        delta. Mirrors the guard already used by ``overlay_cached_prefix``.
         """
+        from headroom.cache.prefix_tracker import _strip_cache_control
+
         if not previous_original_messages or previous_forwarded_messages is None:
             return None
         prefix_len = len(previous_original_messages)
         if len(current_messages) < prefix_len:
             return None
-        if current_messages[:prefix_len] != previous_original_messages:
+        if _strip_cache_control(current_messages[:prefix_len]) != _strip_cache_control(
+            previous_original_messages
+        ):
             return None
         return (
             copy.deepcopy(previous_forwarded_messages),
