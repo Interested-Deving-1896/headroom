@@ -98,6 +98,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **proxy:** Buffered passthrough routes (e.g. `GET /v1/models`) no longer return an opaque HTTP 502 when an OpenAI-compatible upstream closes a pooled keep-alive connection mid-response (`httpx.RemoteProtocolError` / "incomplete chunked read"). Headroom now retries the request once on a fresh connection — mirroring a direct `curl` — and only returns a clear `upstream_protocol_error` 502 if the upstream is genuinely sending an incomplete response ([#1112](https://github.com/chopratejas/headroom/issues/1112)).
 
 
+## [0.30.0](https://github.com/Interested-Deving-1896/headroom/compare/v0.29.0...v0.30.0) (2026-07-07)
+
+
+### Features
+
+* **agent-savings:** land coding + general workload personas on main ([#1732](https://github.com/Interested-Deving-1896/headroom/issues/1732)) ([d8db7da](https://github.com/Interested-Deving-1896/headroom/commit/d8db7da77e07ca9af12c31f29435f6d1e6227d95))
+* **anthropic:** add Claude 5 family pricing & align current rates ([#1767](https://github.com/Interested-Deving-1896/headroom/issues/1767)) ([e84ca98](https://github.com/Interested-Deving-1896/headroom/commit/e84ca980cff59f082a9faf38ba39a61b566aa009))
+* **content-router:** accept any real compression (remove min-savings floor) ([#1771](https://github.com/Interested-Deving-1896/headroom/issues/1771)) ([6c31db9](https://github.com/Interested-Deving-1896/headroom/commit/6c31db97fbd68f88c39a71785335fc8917702fc3))
+* **content-router:** lossless-excluded compaction (grep/log/json) + enable in coding/general personas ([#1762](https://github.com/Interested-Deving-1896/headroom/issues/1762)) ([f067040](https://github.com/Interested-Deving-1896/headroom/commit/f0670404ce21b93ab2ca3d1f93e2fad183562335))
+* **content-router:** lossless-first dispatch, cross-turn dedup, and A7 lossy-after-fold ([#1818](https://github.com/Interested-Deving-1896/headroom/issues/1818)) ([60af15f](https://github.com/Interested-Deving-1896/headroom/commit/60af15f96f1792ad50bf259a765ee188db73d1aa))
+* **proxy:** add provider-only HTTP proxy ([#1807](https://github.com/Interested-Deving-1896/headroom/issues/1807)) ([ebe0a3b](https://github.com/Interested-Deving-1896/headroom/commit/ebe0a3bd7bbc8bbe4ee52bdb1ed7420a405dc224))
+
+
+### Bug Fixes
+
+* **build:** enable Intel macOS pip installs via ort-load-dynamic ([#1538](https://github.com/Interested-Deving-1896/headroom/issues/1538)) ([32ce99e](https://github.com/Interested-Deving-1896/headroom/commit/32ce99e4b4a7d75f31429a553f2211a83992047a))
+* **code-compressor:** CJK-aware relevance-query symbol matching ([#1747](https://github.com/Interested-Deving-1896/headroom/issues/1747)) ([b38315c](https://github.com/Interested-Deving-1896/headroom/commit/b38315cf72e4248cc76cc0e0d10dfa24a4a332e0))
+* **codex:** OpenCode Zen telemetry attribution ([#1648](https://github.com/Interested-Deving-1896/headroom/issues/1648)) ([f18c6bd](https://github.com/Interested-Deving-1896/headroom/commit/f18c6bd896f7b5a153e3b29f7a27b64c65b08fc5))
+* **content-detector:** detect and compress space-separated JSON objects ([#1742](https://github.com/Interested-Deving-1896/headroom/issues/1742)) ([5194bdc](https://github.com/Interested-Deving-1896/headroom/commit/5194bdc5a6e53d331ce0303aba670e8814bb5fd2))
+* **content-router:** token-measure lossless folds at the acceptance gate ([#1772](https://github.com/Interested-Deving-1896/headroom/issues/1772)) ([c5493ea](https://github.com/Interested-Deving-1896/headroom/commit/c5493ea93bae798d489a82167c1f7bcff79eaecb))
+* **copilot:** normalize subscription routing host ([#1836](https://github.com/Interested-Deving-1896/headroom/issues/1836)) ([afd9cbd](https://github.com/Interested-Deving-1896/headroom/commit/afd9cbdfafba0d31bd376a4a43dbcd41b30ec909))
+* **dashboard:** deduplicate repeated savings metrics ([#1804](https://github.com/Interested-Deving-1896/headroom/issues/1804)) ([88f935a](https://github.com/Interested-Deving-1896/headroom/commit/88f935a1eb52ec81cdd60db44627279d411b74ab))
+* **dashboard:** price proxy savings without litellm ([#1728](https://github.com/Interested-Deving-1896/headroom/issues/1728)) ([188e382](https://github.com/Interested-Deving-1896/headroom/commit/188e382b44d09d7f16717377f908869292aab4d9))
+* detect and clear stale ANTHROPIC_BASE_URL from crashed wrap sessions ([#1768](https://github.com/Interested-Deving-1896/headroom/issues/1768)) ([#1837](https://github.com/Interested-Deving-1896/headroom/issues/1837)) ([84509a4](https://github.com/Interested-Deving-1896/headroom/commit/84509a4b892cc256331106c807a3a56107f1eec2))
+* **docker:** persist headroom workspace in compose ([#1839](https://github.com/Interested-Deving-1896/headroom/issues/1839)) ([5e29c06](https://github.com/Interested-Deving-1896/headroom/commit/5e29c06aaf5e3d7d9e591914dc656f24eb72cc07))
+* **install:** pass sc.exe create as raw command line so binPath= quoting survives ([#1654](https://github.com/Interested-Deving-1896/headroom/issues/1654)) ([#1702](https://github.com/Interested-Deving-1896/headroom/issues/1702)) ([d6e0710](https://github.com/Interested-Deving-1896/headroom/commit/d6e07102283745a44aece2222f84c1599eabf90a))
+* **install:** persist --no-http2 override through install apply ([#1676](https://github.com/Interested-Deving-1896/headroom/issues/1676)) ([6fb5f3b](https://github.com/Interested-Deving-1896/headroom/commit/6fb5f3bc3dfa60e56744f85cf049524d43104a31))
+* **opencode:** use local MCP config ([#1383](https://github.com/Interested-Deving-1896/headroom/issues/1383)) ([4bd3ddf](https://github.com/Interested-Deving-1896/headroom/commit/4bd3ddfaa5c5655540494b96e4f5d47724460c7d))
+* **proxy/openai:** thread savings-profile kwargs into chat completions ([#1606](https://github.com/Interested-Deving-1896/headroom/issues/1606)) ([7ff842d](https://github.com/Interested-Deving-1896/headroom/commit/7ff842da170b5bceb5d67048473eeb8a18e09a51))
+* **proxy:** bound Codex WS compression fallback latency ([#1802](https://github.com/Interested-Deving-1896/headroom/issues/1802)) ([d24a3f8](https://github.com/Interested-Deving-1896/headroom/commit/d24a3f842551d36c14dc0ec146a9302e256c5c0f))
+* **proxy:** bound HF tokenizer load and offload token counting off event loop ([#1738](https://github.com/Interested-Deving-1896/headroom/issues/1738)) ([46d5d68](https://github.com/Interested-Deving-1896/headroom/commit/46d5d685d9bcdced1f77ffdc0f2d3a8ee8a1f319))
+* **proxy:** cancel retry backoff on shutdown ([#1834](https://github.com/Interested-Deving-1896/headroom/issues/1834)) ([da2d8dc](https://github.com/Interested-Deving-1896/headroom/commit/da2d8dc9dbf3edfcd1c3f6429db32374a6bebc64))
+* **proxy:** freeze must forward cached (compressed) prefix byte-identical — stop token-mode cache busting ([#1850](https://github.com/Interested-Deving-1896/headroom/issues/1850)) ([248ae0f](https://github.com/Interested-Deving-1896/headroom/commit/248ae0f3e0d4d7ff2e23837e628880dcbda4411a))
+* **proxy:** keep cache_control bounded + stable so the freeze overlay stops busting ([#1852](https://github.com/Interested-Deving-1896/headroom/issues/1852)) ([4820134](https://github.com/Interested-Deving-1896/headroom/commit/48201345be16a8b5aad74e8c390850dce0f34ec4))
+* **proxy:** persist lifetime cache-read savings across restarts ([#1665](https://github.com/Interested-Deving-1896/headroom/issues/1665)) ([908997e](https://github.com/Interested-Deving-1896/headroom/commit/908997ef61d91a7e912637c785176719a5f1c719))
+* **proxy:** retry HTTP/2 stream resets instead of 502ing ([#1645](https://github.com/Interested-Deving-1896/headroom/issues/1645)) ([2ce19c2](https://github.com/Interested-Deving-1896/headroom/commit/2ce19c2c55710cdc5f7a4bb88803f05e4b31feff))
+* **proxy:** retry passthrough on transient upstream connection close ([#1513](https://github.com/Interested-Deving-1896/headroom/issues/1513)) ([5d14080](https://github.com/Interested-Deving-1896/headroom/commit/5d14080c948b04ccd997d2434b37604440701888))
+* **proxy:** stop rtk stat failures from corrupting session baseline ([#1693](https://github.com/Interested-Deving-1896/headroom/issues/1693)) ([681b9a8](https://github.com/Interested-Deving-1896/headroom/commit/681b9a8c1a96af564767d221e92e0ef6620f8a37))
+* **proxy:** strip 1m model suffix before upstream forwarding ([#1840](https://github.com/Interested-Deving-1896/headroom/issues/1840)) ([e22d745](https://github.com/Interested-Deving-1896/headroom/commit/e22d7453d4c6fcf084135ad65c21dd4feb9927ad))
+* **relevance:** gate ONNX embedding backend behind AVX2 to avoid SIGILL ([#1723](https://github.com/Interested-Deving-1896/headroom/issues/1723)) ([#1765](https://github.com/Interested-Deving-1896/headroom/issues/1765)) ([728b330](https://github.com/Interested-Deving-1896/headroom/commit/728b33088b25c390d9b06082afab058e1dc7f028))
+* **rtk:** link managed rtk onto PATH instead of mutating the hook ([#1698](https://github.com/Interested-Deving-1896/headroom/issues/1698)) ([140cb05](https://github.com/Interested-Deving-1896/headroom/commit/140cb05fbc76e0cd1a54d2a8f98cbbd634a227cd))
+* **transforms:** normalize diff compressor context ([#1801](https://github.com/Interested-Deving-1896/headroom/issues/1801)) ([838c523](https://github.com/Interested-Deving-1896/headroom/commit/838c5234a877d4cf96f9e914cfd39d6d6addb211))
+* **transforms:** pass through ragged tables instead of misaligning columns ([#1713](https://github.com/Interested-Deving-1896/headroom/issues/1713)) ([c7665ca](https://github.com/Interested-Deving-1896/headroom/commit/c7665ca08863da12dc9c656bd8bdf1f55c95bda7))
+* **wrap:** replace stale-proxy detection with Vite-style port fallback ([#1406](https://github.com/Interested-Deving-1896/headroom/issues/1406)) ([b4205c6](https://github.com/Interested-Deving-1896/headroom/commit/b4205c68e63e1e12e354508d8c3ac7d54781268b))
+
+
+### Performance Improvements
+
+* **proxy:** cap compression workers to CPU count ([#1803](https://github.com/Interested-Deving-1896/headroom/issues/1803)) ([0a3851b](https://github.com/Interested-Deving-1896/headroom/commit/0a3851b24004727e734b61af4e3f59ce3b0bfe10))
+* **savings:** batch tracker persistence off the request hot path ([#1817](https://github.com/Interested-Deving-1896/headroom/issues/1817)) ([451b9f0](https://github.com/Interested-Deving-1896/headroom/commit/451b9f0867f1eb7cf3a1b479f67a4e3106f7e9be))
+
 ## [0.29.0](https://github.com/headroomlabs-ai/headroom/compare/v0.28.0...v0.29.0) (2026-07-03)
 
 
