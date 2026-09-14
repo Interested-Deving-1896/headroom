@@ -1619,6 +1619,20 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
+        # Say up front whether this log can contain tool output, so whoever is
+        # about to attach it to a bug report does not have to read it to find out.
+        from headroom.cache.compression_store import (
+            PAYLOAD_PREVIEW_ENV,
+            _payload_preview_enabled,
+        )
+
+        headroom_logger.info(
+            "retrieval payload previews: %s (%s)",
+            "ON — this log contains redacted tool output"
+            if _payload_preview_enabled()
+            else "off — sizes only",
+            PAYLOAD_PREVIEW_ENV,
+        )
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass

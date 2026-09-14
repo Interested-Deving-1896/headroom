@@ -175,6 +175,23 @@ HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
 Check the effective setting at `/v1/retrieve/stats` under
 `store.default_ttl_seconds`.
 
+## Logs
+
+Retrieval events in `proxy.log` record the hash, tool, strategy and sizes — not
+the retrieved content. To debug with the content itself, opt in:
+
+```bash
+HEADROOM_LOG_PAYLOAD_PREVIEW=1 headroom proxy
+```
+
+Each retrieval then logs up to 4,096 characters of the original, with common
+credentials redacted (key/value secrets, `Authorization` headers, URL passwords,
+private keys, JWTs, and GitHub, AWS, Slack, Google, Stripe and OpenAI/Anthropic
+keys). Redaction only knows those shapes — customer data and source code pass
+through — so leave previews off in any log you share. The same setting governs
+the MCP server's tool-call logs. The proxy states which mode it is in when its
+log starts.
+
 ## Message-level CCR
 
 > **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that has since been removed. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.

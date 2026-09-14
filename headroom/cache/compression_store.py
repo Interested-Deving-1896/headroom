@@ -52,16 +52,41 @@ DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_S
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
-# Previews carry verbatim tool-result content (post-redaction), which makes
-# proxy.log too sensitive for users to share in bug reports. Set to
-# 0/false/no/off to log byte counts only.
+# Previews carry verbatim tool-result content, which makes proxy.log too
+# sensitive to share in a bug report: redaction removes the secrets it has a
+# pattern for and nothing else (customer data, source, internal hostnames).
+# So they are opt-in: set to 1/true/yes/on to log a redacted, truncated
+# preview. Otherwise retrieval events carry sizes only.
 PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
+# KEY=value, key: value and "key": "value", where the key names a secret. A
+# quoted value goes whole, spaces included; an unquoted one may be an auth
+# scheme plus its credential. The old pattern stopped at the first space, so
+# "Authorization: Bearer <token>" lost the word "Bearer" and kept the token,
+# and it could not see a JSON key at all (the closing quote sat between the
+# key and its colon). TOKEN and AUTH must end the word, so max_tokens,
+# tokenizer and Author are left alone.
 _SECRET_KEY_VALUE_RE = re.compile(
-    r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
-    r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
+    r"(?i)\b([A-Z0-9_.-]*(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|TOKEN(?![A-Z])|SECRET"
+    r"|PASSWORD|PASSWD|CREDENTIALS?|AUTH(?:ORIZATION)?(?![A-Z])|COOKIE)[A-Z0-9_.-]*)"
+    r"([\"']?\s*[:=]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|(?:(?:Bearer|Basic|Token|Digest)\s+)?[^\s\"',;}&]+)"
 )
-_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
-_API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic|Token|Digest)\s+[A-Za-z0-9._~+/=-]{12,}")
+_PRIVATE_KEY_RE = re.compile(
+    # Also when the preview cut ends the block before its END line.
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@")
+# Credentials recognisable by shape alone, wherever they appear.
+_KNOWN_SECRET_RES = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"),  # OpenAI / Anthropic (sk-, sk-proj-, sk-ant-)
+    re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{12,}"),  # Stripe
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),  # GitHub
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),  # AWS access key id
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),  # Slack
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),  # Google API key
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),  # JWT
+)
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -106,17 +131,25 @@ def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
     return f"Entry not found (CCR TTL: {default_ttl} seconds)"
 
 
+def _redact_key_value(match: re.Match[str]) -> str:
+    value = match.group(3)
+    quote = value[0] if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0] else ""
+    return f"{match.group(1)}{match.group(2)}{quote}[REDACTED]{quote}"
+
+
 def _redact_retrieval_log_payload(payload: str) -> str:
-    redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", payload)
+    redacted = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", payload)
+    redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", redacted)
+    redacted = _SECRET_KEY_VALUE_RE.sub(_redact_key_value, redacted)
     redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
-    return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
+    for pattern in _KNOWN_SECRET_RES:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
 
 
 def _payload_preview_enabled() -> bool:
-    raw = os.environ.get(PAYLOAD_PREVIEW_ENV)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    """Opt-in: a preview is verbatim tool output, and redaction is best-effort."""
+    return os.environ.get(PAYLOAD_PREVIEW_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
@@ -548,7 +581,8 @@ class CompressionStore:
             "event": "headroom_retrieve",
             "hash": hash_key,
             "retrieval_type": retrieval_type,
-            "query": query,
+            # The model's own words, which can quote what it read.
+            "query": _redact_retrieval_log_payload(query) if query else query,
             "items_retrieved": items_retrieved,
             "total_items": total_items,
             "tool_name": entry.tool_name,

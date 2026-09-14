@@ -35,8 +35,23 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
-from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.cache.compression_store import (
+    _payload_for_retrieval_log,
+    format_retrieval_miss_detail,
+)
 from headroom.telemetry import session as telemetry_session
+
+
+def _payload_log_fields(value: Any) -> str:
+    """Sizes always; content only when HEADROOM_LOG_PAYLOAD_PREVIEW is on, redacted and capped.
+
+    Tool arguments carry whole documents (``headroom_compress`` takes ``content``)
+    and a retrieve result is the original tool output, so logging them verbatim
+    wrote every compressed and retrieved payload to the log in full.
+    """
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return json.dumps(_payload_for_retrieval_log(text), ensure_ascii=False, separators=(",", ":"))
+
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -709,9 +724,11 @@ class HeadroomMCPServer:
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             started = time.perf_counter()
             logger.info(
-                "event=mcp_tool_call_received tool=%s arguments=%s",
+                "event=mcp_tool_call_received tool=%s arg_keys=%s hash=%s arguments=%s",
                 name,
-                json.dumps(arguments, ensure_ascii=False, default=str),
+                ",".join(sorted(arguments or {})),
+                (arguments or {}).get("hash", ""),
+                _payload_log_fields(arguments or {}),
             )
             try:
                 if name == COMPRESS_TOOL_NAME:
@@ -733,11 +750,7 @@ class HeadroomMCPServer:
                     "event=mcp_tool_call_completed tool=%s duration_ms=%.2f output=%s",
                     name,
                     (time.perf_counter() - started) * 1000.0,
-                    json.dumps(
-                        [getattr(item, "text", str(item)) for item in result],
-                        ensure_ascii=False,
-                        default=str,
-                    ),
+                    _payload_log_fields([getattr(item, "text", str(item)) for item in result]),
                 )
                 return result
             except Exception as e:
@@ -838,7 +851,7 @@ class HeadroomMCPServer:
         logger.info(
             "event=mcp_retrieve_completed hash=%s result=%s",
             hash_key,
-            json.dumps(result, ensure_ascii=False, default=str),
+            _payload_log_fields(result),
         )
 
         return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]

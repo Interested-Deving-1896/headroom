@@ -32,6 +32,7 @@ from headroom.cache.compression_store import (
     CompressionEntry,
     CompressionStore,
     RetrievalEvent,
+    _redact_retrieval_log_payload,
     get_compression_store,
     reset_compression_store,
 )
@@ -60,7 +61,23 @@ def _capture_headroom_retrieve_events():
         logger.setLevel(previous_level)
 
 
-def test_retrieve_logs_payload_preview():
+def test_retrieve_log_carries_sizes_only_by_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("HEADROOM_LOG_PAYLOAD_PREVIEW", raising=False)
+    store = CompressionStore(enable_feedback=False)
+    original = "customer record: jane@example.com, card ending 4242"
+    hash_key = store.store(original=original, compressed="payload")
+
+    with _capture_headroom_retrieve_events() as events:
+        store.retrieve(hash_key)
+
+    assert len(events) == 1
+    assert events[0]["payload_preview"] == ""
+    assert events[0]["payload_chars"] == len(original)
+    assert "jane@example.com" not in json.dumps(events[0])
+
+
+def test_retrieve_logs_payload_preview(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
     store = CompressionStore(enable_feedback=False)
     hash_key = store.store(
         original="secret-ish payload for operator debugging",
@@ -85,7 +102,8 @@ def test_retrieve_logs_payload_preview():
     assert events[0]["tool_name"] == "tool_a"
 
 
-def test_retrieve_log_redacts_secret_payload_values():
+def test_retrieve_log_redacts_secret_payload_values(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
     store = CompressionStore(enable_feedback=False)
     hash_key = store.store(
         original="OPENAI_API_KEY=sk-proj-secret1234567890 Authorization: Bearer token123456789",
@@ -97,10 +115,51 @@ def test_retrieve_log_redacts_secret_payload_values():
 
     assert entry is not None
     assert len(events) == 1
-    assert "sk-proj-secret1234567890" not in events[0]["payload_preview"]
-    assert "Bearer token123456789" not in events[0]["payload_preview"]
-    assert "OPENAI_API_KEY=[REDACTED]" in events[0]["payload_preview"]
-    assert "Authorization: [REDACTED]" in events[0]["payload_preview"]
+    preview = events[0]["payload_preview"]
+    assert "secret1234567890" not in preview
+    # The token itself, not the phrase: "Authorization: [REDACTED] token123456789"
+    # passed the old assertion while leaking the credential.
+    assert "token123456789" not in preview
+    assert "OPENAI_API_KEY=[REDACTED]" in preview
+    assert "Authorization: [REDACTED]" in preview
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Authorization: Bearer abcdef0123456789xyz", "abcdef0123456789xyz"),
+        ('{"api_key": "abcd1234efgh5678", "user": "x"}', "abcd1234efgh5678"),
+        ('{"password": "correct horse battery staple"}', "horse"),
+        ("password='s3cr3t with spaces'", "with spaces"),
+        ("origin https://deploy:hunter2secret@github.com/org/repo.git", "hunter2secret"),
+        ("GITHUB_TOKEN ghp_" + "a1" * 18, "a1" * 18),
+        ("export GH=github_pat_" + "B7" * 20, "B7" * 20),
+        ("key AKIAIOSFODNN7EXAMPLE in config", "AKIAIOSFODNN7EXAMPLE"),
+        ("slack xoxb-123456789012-abcdefghijkl", "abcdefghijkl"),
+        ("stripe sk_live_" + "Z9" * 12, "Z9" * 12),
+        ("google AIza" + "Q" * 35, "Q" * 35),
+        (
+            "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P",
+            "dozjgNryP4J3jVmNHl0w5N",
+        ),
+        (
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234567890\n-----END RSA PRIVATE KEY-----",
+            "MIIEpAIBAAKCAQEA1234567890",
+        ),
+        # Cut off by the preview limit before its END line.
+        (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA",
+            "b3BlbnNzaC1rZXktdjEAAAAA",
+        ),
+    ],
+)
+def test_redaction_removes_the_credential_itself(text: str, secret: str):
+    assert secret not in _redact_retrieval_log_payload(text)
+
+
+def test_redaction_leaves_ordinary_fields_alone():
+    text = "Author: Dev <dev@example.com>\nmax_tokens: 1024\noriginal_tokens=812\ntokenizer: o200k"
+    assert _redact_retrieval_log_payload(text) == text
 
 
 def test_global_store_uses_env_default_ttl(monkeypatch: pytest.MonkeyPatch):

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from headroom.cache.compression_store import _payload_for_retrieval_log
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.helpers import count_cache_breakpoints, log_cache_breakpoints
@@ -125,8 +127,18 @@ def test_payload_preview_disabled_omits_content(monkeypatch) -> None:
     assert event["payload_truncated"] is True
 
 
-def test_payload_preview_enabled_by_default(monkeypatch) -> None:
+def test_payload_preview_disabled_by_default(monkeypatch) -> None:
+    # A preview is verbatim tool output and redaction is best-effort, so it is
+    # opt-in: proxy.log must be safe to attach to a bug report as it stands.
     monkeypatch.delenv("HEADROOM_LOG_PAYLOAD_PREVIEW", raising=False)
+    event = _payload_for_retrieval_log("hello world")
+    assert event["payload_preview"] == ""
+    assert event["payload_chars"] == len("hello world")
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "ON"])
+def test_payload_preview_opt_in(monkeypatch, value) -> None:
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", value)
     event = _payload_for_retrieval_log("hello world")
     assert event["payload_preview"] == "hello world"
 
