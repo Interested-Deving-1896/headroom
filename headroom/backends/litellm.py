@@ -617,7 +617,9 @@ def _thinking_block_to_dict(block: Any) -> dict[str, Any]:
         return block
     if hasattr(block, "model_dump"):
         try:
-            return block.model_dump(exclude_none=True)
+            dumped = block.model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
         except Exception:  # noqa: BLE001 - fall through to attribute scrape
             pass
     return {
