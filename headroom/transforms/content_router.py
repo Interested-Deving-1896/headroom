@@ -4939,6 +4939,16 @@ class ContentRouter(Transform):
 
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
+        # The opening prompt: every user message before the first assistant
+        # turn. See `protect_prompt_text` in _process_content_blocks.
+        first_assistant_index = next(
+            (
+                idx
+                for idx, msg in enumerate(messages)
+                if isinstance(msg, dict) and msg.get("role") == "assistant"
+            ),
+            num_messages,
+        )
         model_limit = kwargs.get("model_limit", 0)
 
         # Adaptive Read protection: protect a fraction of recent messages
@@ -5143,6 +5153,18 @@ class ContentRouter(Transform):
             bias = 1.0  # Default bias, may be overridden for tool messages
 
             messages_from_end = num_messages - i
+            # The caller's own words stay verbatim on a replaying path even
+            # when user messages are compressible for their tool observations:
+            # the opening prompt (a task statement with test ids and paths)
+            # and the text of the newest user turn. Lossy text compression
+            # there rewrites what the model is asked to do, and nothing but a
+            # cache_control marker used to stop it -- a marker Claude Code sets
+            # and plain agents do not.
+            prompt_turn = (
+                prefix_replay_guaranteed
+                and role == "user"
+                and (i < first_assistant_index or messages_from_end == 1)
+            )
 
             # Handle list content (Anthropic format with content blocks)
             if isinstance(content, list):
@@ -5165,6 +5187,7 @@ class ContentRouter(Transform):
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                     prefix_replay_guaranteed=prefix_replay_guaranteed,
+                    protect_prompt_text=prompt_turn,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -5281,8 +5304,11 @@ class ContentRouter(Transform):
                     route_counts["read_protected"] += 1
                     continue
 
-            # Protection 1: Never compress user messages (unless overridden)
-            if skip_user and role == "user":
+            # Protection 1: Never compress user messages (unless overridden).
+            # A string user message after the first assistant turn may be a
+            # text harness's tool observation, so only the opening prompt is
+            # held back when user messages are otherwise compressible.
+            if role == "user" and (skip_user or (prompt_turn and i < first_assistant_index)):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:user_message")
                 route_counts["user_msg"] += 1
@@ -6055,6 +6081,7 @@ class ContentRouter(Transform):
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
         prefix_replay_guaranteed: bool = False,
+        protect_prompt_text: bool = False,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -6116,6 +6143,10 @@ class ContentRouter(Transform):
             skip_system: If True, never compress text blocks in system-role messages.
             compress_assistant_text_blocks: If True, allow compressing text blocks in
                 assistant-role messages. Default False (cache-safe).
+            protect_prompt_text: If True, text blocks in this user message are the
+                caller's prompt (the opening task or the newest user turn) and stay
+                verbatim even when ``skip_user`` is False; tool_result blocks in the
+                same message are still compressible.
 
         Returns:
             Transformed message with compressed content blocks.
@@ -6128,7 +6159,7 @@ class ContentRouter(Transform):
         # outputs and compress freely; assistant defaults to skip (cache
         # safety) with explicit opt-in; unknown roles default to skip.
         if role == "user":
-            protect_text_blocks = skip_user
+            protect_text_blocks = skip_user or protect_prompt_text
         elif role in {"system", "developer"}:
             protect_text_blocks = skip_system
         elif role == "assistant":
