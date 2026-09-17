@@ -2157,10 +2157,13 @@ class OpenAIHandlerMixin:
         # _tool_call_command_text helper:
         #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
         #   - local_shell_call.action  (native Responses shell; argv or string)
+        #   - custom_tool_call.input   (Codex code-mode `exec`: JavaScript calling
+        #                               tools.exec_command({"cmd": …}))
         # Content is gated per-output by _read_output_should_be_protected so
         # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
         # compressible, exactly like the chat path.
         from headroom.transforms.content_router import (
+            _custom_tool_call_commands,
             _is_read_command,
             _read_output_should_be_protected,
             _tool_call_command_text,
@@ -2177,6 +2180,17 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("arguments"))
                 elif item_type == "local_shell_call":
                     command = _tool_call_command_text(item.get("action"))
+                elif item_type == "custom_tool_call":
+                    # One script can run several commands; its single output is a
+                    # read when any of them is (over-protecting only costs savings).
+                    command = next(
+                        (
+                            c
+                            for c in _custom_tool_call_commands(item.get("input"))
+                            if _is_read_command(c)
+                        ),
+                        "",
+                    )
                 else:
                     continue
                 call_id = item.get("call_id")

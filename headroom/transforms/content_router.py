@@ -567,6 +567,40 @@ def _tool_call_command_text(raw: Any) -> str:
     return cmd if isinstance(cmd, str) else ""
 
 
+_EXEC_COMMAND_CALL_RE = re.compile(r"\bexec_command\s*\(")
+
+
+def _custom_tool_call_commands(raw: Any) -> list[str]:
+    """Extract shell commands from a Codex code-mode ``exec`` custom tool call.
+
+    Codex sends shell commands as a Responses ``custom_tool_call`` named ``exec``
+    whose ``input`` is a JavaScript snippet rather than JSON arguments::
+
+        const r = await tools.exec_command({"cmd": "sed -n '1,80p' f.py", "workdir": "…"});
+        text(r.output);
+
+    Returns every ``cmd`` passed to ``exec_command``, in order. Returns ``[]`` when
+    the input is not that shape; an argument object that is not strict JSON is
+    skipped, which leaves the output compressible exactly as before.
+    """
+    if not isinstance(raw, str) or "exec_command" not in raw:
+        return []
+    decoder = json.JSONDecoder()
+    commands: list[str] = []
+    for match in _EXEC_COMMAND_CALL_RE.finditer(raw):
+        start = raw.find("{", match.end())
+        if start < 0 or raw[match.end() : start].strip():
+            continue
+        try:
+            args, _end = decoder.raw_decode(raw, start)
+        except ValueError:
+            continue
+        command = _tool_call_command_text(args)
+        if command:
+            commands.append(command)
+    return commands
+
+
 def _fenced_shell_command(content: Any) -> str:
     """Extract the shell command from a TEXT-BASED agent's fenced code block.
 
