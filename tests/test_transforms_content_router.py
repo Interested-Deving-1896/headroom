@@ -2092,6 +2092,52 @@ def test_text_harness_observation_string_still_compresses_under_replay(
     assert _FRESH_CC_OUTPUT in calls
 
 
+def test_follow_up_prompt_string_after_assistant_turn_is_verbatim_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A plain-string follow-up after an assistant reply is the caller's new
+    # instruction, the same as the list-content case above.
+    router, calls = _prompt_router(monkeypatch)
+    follow_up = "Now also handle the async path in tenacity/asyncio. " * 60
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "All 167 tests pass on the sync path."},
+        {"role": "user", "content": follow_up},
+    ]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[2]["content"] == follow_up
+    assert follow_up not in calls
+
+
+def test_text_harness_observation_text_block_still_compresses_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The list-content twin of the string observation above: both shapes
+    # decide "prompt or observation" the same way.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "```bash\npytest -q\n```"},
+        {"role": "user", "content": [{"type": "text", "text": _FRESH_CC_OUTPUT}]},
+    ]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _FRESH_CC_OUTPUT in calls
+
+
 def test_prompt_text_compresses_without_replay_guarantee(monkeypatch: pytest.MonkeyPatch) -> None:
     # SDK / document callers that opt into user compression keep it: a
     # spreadsheet or pasted document in a user message is the payload.

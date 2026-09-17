@@ -1536,19 +1536,23 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
         if registry is not None:
             registry.pop(turn_id)
         billed = turn.billed.as_anthropic() if turn.billed is not None else None
+        # After a re-drive the answer is either the hook's replacement or, when
+        # the hook handed back the latest provider response (``response: null``),
+        # the response the gateway posted on this call. Either way the client made
+        # one call, so its response reports what the provider billed for all of
+        # it, the way a server-side tool loop does, in the response's own usage
+        # shape. A turn with no re-drive keeps ``response: null``: the gateway's
+        # held response already carries the whole bill.
+        answer = final_response if final_response is not None else response
         if (
             turn.rounds > 0
             and billed
-            and isinstance(final_response, dict)
-            and isinstance(final_response.get("usage"), dict)
+            and isinstance(answer, dict)
+            and isinstance(answer.get("usage"), dict)
         ):
-            # The client made one call; its response reports what the provider
-            # billed for all of it, the way a server-side tool loop does,
-            # rather than only the last round. Written in the response's own
-            # usage shape.
             final_response = {
-                **final_response,
-                "usage": _usage_in_shape(final_response["usage"], turn.billed),
+                **answer,
+                "usage": _usage_in_shape(answer["usage"], turn.billed),
             }
         return JSONResponse(
             {
