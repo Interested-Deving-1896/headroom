@@ -77,6 +77,10 @@ def _xls_cell(cell: object, datemode: int) -> object:
     so a whole number arrives as ``12.0``. Left alone, the two loaders disagree
     about the same workbook -- ``45292.0`` here against ``2024-01-01 00:00:00``
     there -- and the date is not recoverable from the text.
+
+    Sub-second precision is dropped: ``xldate_as_tuple`` returns whole seconds, so
+    ``datetime(2024, 1, 1, 12, 34, 56, 500000)`` renders as ``2024-01-01 12:34:56``
+    where openpyxl keeps the microseconds.
     """
     import xlrd
 
@@ -94,7 +98,14 @@ def _xls_cell(cell: object, datemode: int) -> object:
         return datetime(year, month, day, hour, minute, second)
     if kind == xlrd.XL_CELL_BOOLEAN:
         return bool(value)
-    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer():
+    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer() and abs(value) < 2**53:
+        # Bounded to where a double is exact. Past 2**53 consecutive integers are
+        # no longer representable, so int() would render the double's exact value
+        # rather than the number that was typed: a workbook holding
+        # 123456789012345678 renders as 123456789012345680, fabricating its last
+        # digits and handing the agent a wrong identifier that reads as exact.
+        # Falling through to the float repr says "approximate" out loud -- and
+        # restores parity with _load_xlsx, which shows the repr for that cell.
         return int(value)
     if kind == xlrd.XL_CELL_ERROR:
         # openpyxl with data_only=True gives the text Excel shows, e.g. #DIV/0!
@@ -145,5 +156,5 @@ def load_spreadsheet(path: str | Path) -> dict[str, str]:
     if suffix == ".xlsx":
         return _load_xlsx(p)
     if suffix == ".xls":
-        return _load_xls(p)  # pragma: no cover - legacy .xls path, see _load_xls
+        return _load_xls(p)
     raise ValueError(f"Unsupported spreadsheet format '{suffix}'. Supported: .xlsx, .xls")
