@@ -275,4 +275,31 @@ async def test_reset_runtime_clears_rate_limit_and_failure_splits() -> None:
     assert metrics.requests_rate_limited == 0
     assert metrics.requests_failed == 0
     assert metrics.requests_rate_limited_by_source == {"headroom": 0, "upstream": 0}
-    assert dict(metrics.requests_failed_by_provider) == {}
+    # Re-seeded, not emptied: the metric must keep exporting a sample after a
+    # reset, same as the rate-limit source series above.
+    assert dict(metrics.requests_failed_by_provider) == {"unknown": 0}
+
+
+@pytest.mark.asyncio
+async def test_failed_total_exports_a_sample_before_any_failure() -> None:
+    """A healthy proxy must still export ``headroom_requests_failed_total``.
+
+    Before the provider label this counter was always present as a bare
+    ``headroom_requests_failed_total 0``. A labelled map that starts empty
+    emits no sample at all, which makes the documented failure-rate query
+    return an empty vector (an empty numerator empties the whole expression),
+    so the panel reads "No data" instead of 0% while everything is fine --
+    and `absent()` alerts fire on healthy proxies.
+    """
+    metrics = PrometheusMetrics(stateless=True)
+
+    text = await metrics.export()
+
+    assert 'headroom_requests_failed_total{provider="unknown"} 0' in text
+
+    # The seed must not survive as a duplicate once a real provider fails.
+    await metrics.record_failed(provider="anthropic")
+    text = await metrics.export()
+    assert 'headroom_requests_failed_total{provider="anthropic"} 1' in text
+    assert 'headroom_requests_failed_total{provider="unknown"} 0' in text
+    assert metrics.requests_failed == 1

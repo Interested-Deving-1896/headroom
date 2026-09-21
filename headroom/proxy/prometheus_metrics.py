@@ -42,6 +42,10 @@ RATE_LIMIT_SOURCE_HEADROOM = "headroom"
 RATE_LIMIT_SOURCE_UPSTREAM = "upstream"
 RATE_LIMIT_SOURCES = (RATE_LIMIT_SOURCE_HEADROOM, RATE_LIMIT_SOURCE_UPSTREAM)
 
+# Bucket for a failure with no attributed provider. Also seeded at zero so
+# headroom_requests_failed_total always exports at least one sample.
+_PROVIDER_UNKNOWN = "unknown"
+
 
 def _rate_limit_source(source: str | None) -> str:
     """Clamp ``source`` to the closed label set, defaulting to Headroom's limiter.
@@ -132,7 +136,17 @@ class PrometheusMetrics:
         # funnel, which also took them out of ``requests_by_provider`` (only
         # record_request touches that), leaving Prometheus with no way to tell
         # which upstream was failing. Kept alongside the unlabelled total.
-        self.requests_failed_by_provider: dict[str, int] = defaultdict(int)
+        #
+        # Seeded with the "unknown" bucket at zero so the metric always exports
+        # at least one sample. Before this counter carried a label it was always
+        # present as a bare ``headroom_requests_failed_total 0``; a labelled map
+        # that starts empty would emit NO sample on a healthy proxy, which turns
+        # the documented failure-rate query into an empty vector (an empty
+        # numerator makes the whole expression empty, so the panel reads
+        # "No data" instead of 0%) and would make ``absent()`` alerts fire on
+        # healthy proxies. "unknown" is a real bucket -- record_failed uses it
+        # when no provider is attributed -- so seeding it invents no provider.
+        self.requests_failed_by_provider: dict[str, int] = defaultdict(int, {_PROVIDER_UNKNOWN: 0})
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -378,6 +392,8 @@ class PrometheusMetrics:
             self.requests_rate_limited_by_source = dict.fromkeys(RATE_LIMIT_SOURCES, 0)
             self.requests_failed = 0
             self.requests_failed_by_provider.clear()
+            # Re-seed so /metrics keeps exporting a sample after a reset.
+            self.requests_failed_by_provider[_PROVIDER_UNKNOWN] = 0
             self.inbound_requests_total = 0
             self.inbound_requests_completed = 0
             self.inbound_requests_active = 0
@@ -1240,7 +1256,7 @@ class PrometheusMetrics:
     async def record_failed(self, *, provider: str | None = None, model: str | None = None):
         async with self._lock:
             self.requests_failed += 1
-            self.requests_failed_by_provider[provider or "unknown"] += 1
+            self.requests_failed_by_provider[provider or _PROVIDER_UNKNOWN] += 1
         self.savings_tracker.record_lifetime_failed(provider=provider, model=model)
         self._get_otel_metrics().record_proxy_failed(provider=provider, model=model)
 
