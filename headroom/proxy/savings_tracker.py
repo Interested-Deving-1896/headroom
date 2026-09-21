@@ -1210,12 +1210,22 @@ class SavingsTracker:
             self._maybe_save_locked()
 
     def record_lifetime_rate_limited(
-        self, *, provider: str | None = None, model: str | None = None
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        source: str = "headroom",
     ) -> None:
-        """Record a rate-limited proxy request without changing legacy history."""
+        """Record a rate-limited proxy request without changing legacy history.
+
+        ``source`` distinguishes Headroom's own limiter from an upstream 429 —
+        see ``PrometheusMetrics.record_rate_limited``.
+        """
 
         with self._lock:
-            self._persistent_metrics.record_rate_limited(provider=provider, model=model)
+            self._persistent_metrics.record_rate_limited(
+                provider=provider, model=model, source=source
+            )
             self._maybe_save_locked()
 
     def record_lifetime_cache_bust(self, *, tokens_lost: int) -> None:
