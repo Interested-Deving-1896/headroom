@@ -514,9 +514,14 @@ class _StubXlsCell:
         self.value = value
 
 
-@pytest.mark.parametrize("value", [12.0, 1e15, float(2**53 - 1)])
+@pytest.mark.parametrize("value", [12.0, 1e15, float(2**53 - 1), float(2**53), float(-(2**53))])
 def test_xls_cell_converts_exact_whole_numbers_to_int(value: float) -> None:
-    """Below 2**53 every integer is representable, so ``int()`` loses nothing."""
+    """At or below 2**53 every integer is representable, so ``int()`` loses nothing.
+
+    The bound is inclusive at both ends: +/-2**53 is exactly representable, and
+    openpyxl reads the same value from an .xlsx as an ``int``, so excluding it
+    would make the two loaders disagree at exactly the boundary.
+    """
     xlrd = pytest.importorskip("xlrd")
 
     from headroom.transforms.spreadsheet_ingest import _xls_cell
@@ -527,9 +532,15 @@ def test_xls_cell_converts_exact_whole_numbers_to_int(value: float) -> None:
     assert rendered == int(value)
 
 
-@pytest.mark.parametrize("value", [float(2**53), 1e16, 1e20, 123456789012345678.0])
+@pytest.mark.parametrize(
+    "value",
+    [float(2**53 + 2), float(-(2**53) - 2), 1e16, 1e20, 123456789012345678.0],
+)
 def test_xls_cell_keeps_numbers_past_2_53_as_floats(value: float) -> None:
     """Past 2**53 ``int()`` would fabricate digits the workbook never held.
+
+    ``2**53 + 2`` is the first whole number above the boundary (``2**53 + 1``
+    is not representable at all), and ``-(2**53) - 2`` its negative mirror.
 
     xlrd hands back a double, and above 2**53 consecutive integers are no longer
     representable, so ``int()`` renders the double's exact value rather than the

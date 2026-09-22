@@ -98,14 +98,17 @@ def _xls_cell(cell: object, datemode: int) -> object:
         return datetime(year, month, day, hour, minute, second)
     if kind == xlrd.XL_CELL_BOOLEAN:
         return bool(value)
-    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer() and abs(value) < 2**53:
-        # Bounded to where a double is exact. Past 2**53 consecutive integers are
+    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer() and abs(value) <= 2**53:
+        # Bounded to where a double is exact. PAST 2**53 consecutive integers are
         # no longer representable, so int() would render the double's exact value
         # rather than the number that was typed: a workbook holding
         # 123456789012345678 renders as 123456789012345680, fabricating its last
         # digits and handing the agent a wrong identifier that reads as exact.
-        # Falling through to the float repr says "approximate" out loud -- and
-        # restores parity with _load_xlsx, which shows the repr for that cell.
+        # Falling through to the float repr says "approximate" out loud.
+        #
+        # The bound is inclusive: +/-2**53 is itself exactly representable, and
+        # openpyxl loads the same cell in an .xlsx as int 9007199254740992, so
+        # excluding it would break the loader parity this function exists for.
         return int(value)
     if kind == xlrd.XL_CELL_ERROR:
         # openpyxl with data_only=True gives the text Excel shows, e.g. #DIV/0!
