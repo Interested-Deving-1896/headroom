@@ -1624,8 +1624,12 @@ mod tests {
 
     #[test]
     fn crush_object_keeps_every_key_when_nested_arrays_compact() {
-        // A 40-key object whose values include a large array: the array
-        // may be compacted, but not one enclosing key may disappear.
+        // The behaviour this refactor relies on: recursing into object VALUES
+        // still compacts a nested array, and the enclosing key survives that
+        // compaction. The array has to actually shrink for the test to mean
+        // anything -- an all-scalar object would pass even if recursion were
+        // removed from the object branch, which is the whole thing being
+        // guarded here.
         let mut obj = serde_json::Map::new();
         for i in 0..40 {
             obj.insert(
@@ -1635,14 +1639,49 @@ mod tests {
                 )),
             );
         }
+        let rows: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "name": format!("row-{i}"),
+                    "status": if i % 3 == 0 { "error" } else { "ok" },
+                    "detail": format!("detail text for row {i} padded out a bit"),
+                })
+            })
+            .collect();
+        let row_count = rows.len();
+        obj.insert("records".to_string(), Value::Array(rows));
+
         let value = Value::Object(obj);
         let input = serde_json::to_string(&value).expect("serialize");
         let result = crusher().crush(&input, "", 1.0);
         let out: Value = serde_json::from_str(&result.compressed).expect("valid JSON out");
         let got = out.as_object().expect("object out");
-        assert_eq!(got.len(), 40, "all 40 keys must survive");
+
+        assert_eq!(got.len(), 41, "all 40 scalar keys + `records` must survive");
         for k in value.as_object().unwrap().keys() {
             assert!(got.contains_key(k), "dropped key {k}");
+        }
+
+        // The nested array took a compaction path...
+        assert!(
+            result.was_modified,
+            "nested array should have been compacted; strategy={} out={}",
+            result.strategy, result.compressed
+        );
+        let compacted = got.get("records").expect("`records` key survived");
+        assert_ne!(
+            compacted,
+            value.as_object().unwrap().get("records").unwrap(),
+            "`records` should have been transformed, not passed through verbatim"
+        );
+        // ...and shrank, while its enclosing key stayed put.
+        if let Some(arr) = compacted.as_array() {
+            assert!(
+                arr.len() < row_count,
+                "compacted array should hold fewer than {row_count} items, got {}",
+                arr.len()
+            );
         }
     }
 
