@@ -700,6 +700,12 @@ def _create_onnx_session(
     for filename in _onnx_filename_candidates():
         try:
             onnx_path = _hf_artifact(model_id, filename, allow_network=allow_download)
+        except KompressModelNotCached:
+            # Only _hf_artifact's air-gap translation raises this here, and it
+            # is terminal for the whole loop: every remaining candidate would be
+            # refused for the same reason, so trying them just logs the same
+            # refusal four times and ends on a misleading FileNotFoundError.
+            raise
         except Exception as exc:
             last_err = exc
             cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)

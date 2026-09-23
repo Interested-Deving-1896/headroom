@@ -632,6 +632,30 @@ class TestModelLoadersDegradeExplicitly:
         assert "HEADROOM_OFFLINE" in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
 
+    def test_the_onnx_candidate_loop_stops_at_the_refusal(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loader tries four ONNX filenames in turn. A refusal applies to
+        all four, so it must be terminal — otherwise the operator gets the same
+        warning four times and a closing ``FileNotFoundError`` that says
+        nothing about the air-gap."""
+        import huggingface_hub
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        from headroom.transforms import kompress_compressor
+
+        attempts: list[str] = []
+
+        def fake_download(repo_id, filename, *, revision=None, local_files_only=False):
+            attempts.append(filename)
+            raise LocalEntryNotFoundError("cold cache")
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+        with pytest.raises(kompress_compressor.KompressModelNotCached):
+            kompress_compressor._create_onnx_session("acme/model", [], allow_download=True)
+        # One candidate tried (the cache probe plus the refused network call).
+        assert len(set(attempts)) == 1
+
     def test_a_warm_cache_is_unaffected(
         self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1114,11 +1138,12 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
     ),
     "memory/adapters/embedders.py": (
         2,
-        "loopback: OllamaEmbedder against the operator's own Ollama base_url "
-        "(defaults to 127.0.0.1:11434). The second site is OpenAIEmbedder's "
-        "AsyncOpenAI client, which is unguarded and opt-in-cloud by "
-        "configuration — same reasoning as memory/backends/direct_mem0.py, "
-        "out of scope for A-2. (The HF model fetches in this file go through "
+        "unguarded: two different sites, labelled by the weaker of them. One is "
+        "loopback (OllamaEmbedder against the operator's own base_url, default "
+        "127.0.0.1:11434); the other is OpenAIEmbedder's AsyncOpenAI client, "
+        "which really does reach api.openai.com and is opt-in-cloud by "
+        "configuration — same reasoning as memory/backends/direct_mem0.py, out "
+        "of scope for A-2. (The HF model fetches in this file go through "
         "onnx_runtime.hf_hub_download_local_first, which now guards.)",
     ),
     "copilot_auth.py": (
