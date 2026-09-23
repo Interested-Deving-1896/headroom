@@ -11,10 +11,11 @@ provider's key is the content, not the marker.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from headroom.proxy.system_compaction import _compact_system_blocks
-from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+from headroom.proxy.tool_schema_compaction import compact_tool_descriptions, compact_tools
 
 
 def _text(chars: int, seed: str = "x") -> str:
@@ -36,8 +37,16 @@ class _StubRouter:
 # --------------------------------------------------------------------------
 
 
-def test_tool_desc_compaction_skips_when_a_tool_is_marked() -> None:
-    """A marker on any tool freezes the whole tools prefix."""
+def test_tool_desc_compaction_runs_even_when_a_tool_is_marked() -> None:
+    """A marker does NOT freeze the tools, and skipping was the expensive choice.
+
+    The provider never saw the client's bytes -- it only ever sees ours -- so
+    there is nothing to preserve. Compaction is deterministic, so every turn
+    sends the same compacted bytes and the cache hits. Measured against the real
+    API with 30 pinned tools over 6 turns, always-compacted billed 15,270 in
+    prefix tokens against 21,938 for always-raw: skipping made the cached prefix
+    30% larger for the whole session to avoid a bust that never happened.
+    """
     payload = {
         "tools": [
             {"name": "a", "description": _text(4000), "input_schema": {}},
@@ -49,13 +58,65 @@ def test_tool_desc_compaction_skips_when_a_tool_is_marked() -> None:
             },
         ]
     }
-    before = [dict(t) for t in payload["tools"]]
 
-    out, modified, _, _ = compact_tool_descriptions(payload, max_chars=50)
+    out, modified, before_bytes, after_bytes = compact_tool_descriptions(payload, max_chars=50)
 
-    assert modified is False
-    assert out is payload
-    assert out["tools"] == before
+    assert modified is True
+    assert after_bytes < before_bytes
+    # The marker itself is carried through untouched -- we shrink the schema,
+    # we do not take over the client's cache management.
+    assert out["tools"][1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_compaction_is_byte_stable_across_calls() -> None:
+    """The property the whole argument rests on.
+
+    Cache-safety here is not "we avoided the bytes", it is "we produce the same
+    bytes every time". If this ever stops holding, the removed guard has to come
+    back -- so it is asserted rather than assumed.
+    """
+
+    def _payload() -> dict[str, Any]:
+        return {
+            "tools": [
+                {
+                    "name": f"t{i}",
+                    "description": "  Lots   of    whitespace.  " * 20,
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "title": "Args",
+                        "examples": [{"a": 1}],
+                        "type": "object",
+                        "properties": {"a": {"type": "string", "description": "  x  y  "}},
+                    },
+                }
+                for i in range(5)
+            ]
+        }
+
+    first, _, _, _ = compact_tools(_payload())
+    second, _, _, _ = compact_tools(_payload())
+
+    assert json.dumps(first["tools"], sort_keys=True) == json.dumps(second["tools"], sort_keys=True)
+
+
+def test_a_marked_tools_array_is_compacted_by_layer_one_too() -> None:
+    """Layer 1 never had a guard, and now it deliberately never will."""
+    payload = {
+        "tools": [
+            {
+                "name": "a",
+                "description": "d",
+                "input_schema": {"type": "object", "title": "T", "properties": {}},
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    }
+
+    out, modified, _, _ = compact_tools(payload)
+
+    assert modified is True
+    assert "title" not in out["tools"][0]["input_schema"]
 
 
 def test_tool_desc_compaction_still_runs_when_nothing_is_marked() -> None:

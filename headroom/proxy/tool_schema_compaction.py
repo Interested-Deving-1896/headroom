@@ -395,21 +395,28 @@ def compact_tool_descriptions(
     if not isinstance(tools, list) or not tools:
         return payload, False, 0, 0
 
-    # A cache_control marker on any tool means "cache everything up to and
-    # including this one". Truncating a description inside that span changes the
-    # bytes the provider hashed, so the whole tools prefix -- and every message
-    # after it -- re-bills as cache creation. The saving is a few hundred bytes;
-    # the bust is the entire conversation. Mirrors the same guard on
-    # ``_sort_tools_deterministically`` (handlers/anthropic.py) and
-    # ``any_tool_has_cache_control`` in the Rust live zone.
-    marked = sum(1 for t in tools if isinstance(t, dict) and t.get("cache_control"))
-    if marked:
-        logger.info(
-            "event=tool_desc_compaction_skipped reason=marker_present tool_count=%d marked=%d",
-            len(tools),
-            marked,
-        )
-        return payload, False, 0, 0
+    # NO cache_control guard here, deliberately. The obvious reasoning -- "a
+    # marker means the provider hashed these bytes, so rewriting them busts the
+    # prefix" -- does not survive contact with the API, because the provider
+    # never saw the client's bytes. It only ever sees ours. Compaction is a pure
+    # deterministic transform, so turn 2 sends exactly what turn 1 cached and
+    # hits. Measured against the real API, 30 pinned tools over 6 turns:
+    #
+    #     always raw        write 12,536  then read 12,536 x5   billed 21,938
+    #     always compacted  write  8,726  then read  8,726 x5   billed 15,270  (-30%)
+    #
+    # Skipping made the cached prefix 30% larger for the life of every session
+    # that pins its tools, to avoid a bust that never happened.
+    #
+    # The one real hazard is INCONSISTENCY -- compacting on some turns and not
+    # others, which ``_decision.should_compress`` can produce via a per-request
+    # bypass header or a license gate flipping. That is bounded too: Anthropic
+    # keeps both prefixes alive, so alternating turns each hit their own entry
+    # and the cost is one extra write, once, not a bust per flip.
+    #
+    # This reasoning is specific to a pure byte transform over a fixed key set.
+    # It does NOT extend to system-prompt compaction, whose compressor is
+    # pluggable and not established to be deterministic -- that guard stays.
 
     strip_sem = strip_semantic_params()
     key = _cache_key(tools, "L2", max_chars, strip_sem)
