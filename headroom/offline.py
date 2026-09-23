@@ -60,7 +60,7 @@ def apply_offline_env() -> None:
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 
-class OfflineEgressBlocked(RuntimeError):
+class OfflineEgressBlocked(BaseException):
     """Raised by :func:`guard_egress` when ``HEADROOM_OFFLINE`` is in force.
 
     A distinct, named type so callers can tell "the operator air-gapped this
@@ -68,9 +68,32 @@ class OfflineEgressBlocked(RuntimeError):
     several Headroom egress paths deliberately fail OPEN on network errors
     (remote Kompress passes content through verbatim, the license reporter
     falls back to a cached grant). Fail-open is right for a flaky endpoint and
-    WRONG for a policy refusal: swallowing this exception would turn the
-    air-gap switch back into a suggestion. Anything that catches broad
-    ``Exception`` around an egress call should re-raise this.
+    WRONG for a policy refusal: swallowing this turns the air-gap switch back
+    into a suggestion.
+
+    **It derives from BaseException, not Exception, on purpose.** The first
+    version of this class was a ``RuntimeError`` whose docstring asked every
+    broad handler to re-raise it. Nothing did — there were zero re-raise sites
+    in the package — and the refusal was swallowed by four reachable
+    ``except Exception`` blocks on the way out of a single ``/v1/messages``
+    request, which returned 200 with the content uncompressed while the guard
+    had fired twice. A convention that has to be re-applied at every future
+    ``except Exception`` in a 100k-line codebase is not a guarantee; the type
+    hierarchy is. This is the same reason ``KeyboardInterrupt`` and
+    ``SystemExit`` sit outside ``Exception``: a policy decision is control
+    flow, not a runtime error to degrade around.
+
+    Consequences to know about:
+
+    * ``except Exception`` no longer catches it anywhere — including in
+      third-party code (httpx, the OTEL SDK, Starlette's error middleware).
+    * ``except BaseException`` still does. Those are rare, they are enumerated
+      by ``tests/test_offline_egress_chokepoint.py``'s broad-handler sweep, and
+      each must either re-raise or carry a written reason.
+    * Reaching this at request time means the operator changed the environment
+      under a running proxy; the ordinary contradictory-configuration case is
+      caught at startup by ``headroom/proxy/server.py``'s offline preflight,
+      which exits 78 with an explanation instead.
     """
 
     def __init__(self, purpose: str, destination: str | None = None) -> None:

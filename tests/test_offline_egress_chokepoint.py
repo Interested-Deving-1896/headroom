@@ -41,6 +41,7 @@ import socket
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,12 +106,35 @@ class TestGuardEgress:
         monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
         assert guard_egress("widget sync", "https://widgets.example.com") is None
 
-    def test_is_not_a_bare_runtime_error(self) -> None:
-        # Callers need to distinguish a policy refusal from a flaky network so
-        # their fail-open handlers can re-raise it. A bare RuntimeError would
-        # be indistinguishable.
-        assert issubclass(OfflineEgressBlocked, RuntimeError)
-        assert OfflineEgressBlocked is not RuntimeError
+    def test_is_outside_the_exception_hierarchy(self) -> None:
+        """The refusal must survive a ``except Exception`` fail-open handler.
+
+        It used to be a ``RuntimeError`` and the module docstring asked every
+        broad handler to re-raise it. Nothing did: four reachable
+        ``except Exception`` blocks turned the refusal into silent degradation,
+        and a full ``/v1/messages`` request under ``HEADROOM_OFFLINE=1`` with a
+        remote Kompress endpoint returned 200 with the content uncompressed
+        while the guard had fired twice. The convention was the bug; the type
+        is the fix.
+        """
+        assert issubclass(OfflineEgressBlocked, BaseException)
+        assert not issubclass(OfflineEgressBlocked, Exception), (
+            "OfflineEgressBlocked must stay outside Exception, or every "
+            "`except Exception:` fail-open handler in the tree silently "
+            "downgrades an air-gap refusal to 'that feature stopped working'."
+        )
+
+    def test_a_broad_exception_handler_cannot_swallow_it(self, offline: None) -> None:
+        """The property above, exercised rather than asserted about."""
+        swallowed = False
+        try:
+            try:
+                guard_egress("widget sync", "https://widgets.example.com")
+            except Exception:  # noqa: BLE001 — the whole point of the test
+                swallowed = True
+        except OfflineEgressBlocked:
+            pass
+        assert not swallowed
 
 
 # ──────────────────────── path 1: remote Kompress ───────────────────────────
@@ -438,6 +462,274 @@ class TestRustOfflineParity:
             "the offline guard runs after Api::new(), which already resolves the "
             "Hub endpoint and builds the ureq agent — guard before the client "
             "exists, not before the request"
+        )
+
+
+# ─────────── the refusal has to survive the fail-open handlers ──────────────
+
+
+class TestRefusalSurvivesFailOpenHandlers:
+    """Raising was never the hard part; being heard was.
+
+    Under ``HEADROOM_OFFLINE=1`` + ``HEADROOM_KOMPRESS_ENDPOINT``, a full
+    ``/v1/messages`` request used to return **200 with the content
+    uncompressed** while ``guard_egress`` had fired twice: every fail-open
+    ``except Exception`` between the guard and the response logged a warning
+    and passed the content through. Each site below is one of those handlers,
+    exercised with a compressor that refuses.
+    """
+
+    def test_thinking_compactor_does_not_swallow_it(self) -> None:
+        """``_memo_compact`` wraps ``kompress.compress(...)`` — the very call
+        the in-``compress()`` guard protects — in ``except Exception``."""
+        from headroom.transforms.thinking_compactor import _memo_compact
+
+        class _Refusing:
+            def compress(self, text: str, allow_download: bool = False) -> object:
+                raise OfflineEgressBlocked("remote Kompress inference", "https://k.example.com")
+
+        with pytest.raises(OfflineEgressBlocked):
+            _memo_compact("a2 offline probe, unique so the memo cache misses", _Refusing())
+
+    def test_kompress_model_ready_does_not_report_a_refusal_as_ready(self) -> None:
+        """``_kompress_model_ready`` answered ``except Exception: return True``
+        — reporting a policy refusal as "the model is ready"."""
+        from headroom.transforms.content_router import ContentRouter
+
+        class _Stub:
+            config = SimpleNamespace(enable_kompress=True)
+            _runtime_kompress_model = None
+            _kompress_model_ready = ContentRouter._kompress_model_ready
+
+            def _get_kompress(self) -> object:
+                raise OfflineEgressBlocked("remote Kompress inference", "https://k.example.com")
+
+        with pytest.raises(OfflineEgressBlocked):
+            _Stub()._kompress_model_ready()
+
+    def test_the_router_reaching_for_remote_kompress_propagates(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.transforms.content_router import ContentRouter
+
+        monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "https://kompress.example.com")
+
+        class _Stub:
+            config = SimpleNamespace(ccr_inject_marker=True)
+            _kompress_remote = None
+            _get_remote_kompress = ContentRouter._get_remote_kompress
+
+        with pytest.raises(OfflineEgressBlocked):
+            _Stub()._get_remote_kompress()
+
+    def test_the_native_detector_fallback_reraises_it(self) -> None:
+        """``_detect_content``'s ``except BaseException`` degrades a native
+        panic to the pure-Python detector. It re-raises the control-flow
+        BaseExceptions; the air-gap refusal is now on that list."""
+        from headroom.transforms import content_router
+
+        source = Path(content_router.__file__).read_text(encoding="utf-8")
+        assert (
+            "except (KeyboardInterrupt, SystemExit, GeneratorExit, OfflineEgressBlocked):" in source
+        )
+
+
+class TestBroadHandlerSweep:
+    """``except Exception`` can no longer swallow the refusal — the type sees
+    to that. ``except BaseException`` and bare ``except:`` still can, so they
+    are enumerated here and each one has to either re-raise or carry a reason.
+
+    This is the test the brief asked for: "fails if a new broad handler
+    swallows it". It is deliberately a whole-tree sweep rather than a list of
+    the four handlers that were found, because the four were found by hand and
+    the fifth will not be.
+    """
+
+    # file -> (line count, reason). Each of these hands the caught exception
+    # back to another thread that re-raises it, so the refusal is delayed but
+    # never lost.
+    _ALLOWED: dict[str, tuple[int, str]] = {
+        "tokenizers/huggingface.py": (
+            1,
+            "relayed: the handler appends to `error` and the calling thread "
+            "re-raises it after join(). Not a swallow, a hand-off.",
+        ),
+        "tokenizers/tiktoken_counter.py": (
+            1,
+            "relayed: stores into box['err'], re-raised in the calling thread.",
+        ),
+        "transforms/content_router.py": (
+            2,
+            "relayed: both are watchdog-thread bodies that store into a box "
+            "the caller re-raises from. The third handler in this file, the "
+            "native-detect degrade path, re-raises OfflineEgressBlocked "
+            "explicitly and so does not appear here.",
+        ),
+    }
+
+    @staticmethod
+    def _broad_handlers() -> dict[str, list[tuple[int, str]]]:
+        found: dict[str, list[tuple[int, str]]] = {}
+        for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+            try:
+                source = path.read_text(encoding="utf-8")
+                tree = ast.parse(source)
+            except (UnicodeDecodeError, SyntaxError):  # pragma: no cover - defensive
+                continue
+            lines = source.splitlines()
+            hits: list[tuple[int, str]] = []
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Try):
+                    continue
+                # A sibling handler that catches the refusal first makes every
+                # later handler on this try safe.
+                sibling_reraises = any(
+                    handler.type is not None
+                    and "OfflineEgressBlocked" in ast.unparse(handler.type)
+                    and any(isinstance(stmt, ast.Raise) for stmt in handler.body)
+                    for handler in node.handlers
+                )
+                for handler in node.handlers:
+                    caught = "" if handler.type is None else ast.unparse(handler.type)
+                    if handler.type is not None and "BaseException" not in caught:
+                        continue
+                    if sibling_reraises:
+                        continue
+                    if isinstance(handler.body[-1], ast.Raise):
+                        continue  # unconditional re-raise
+                    if "OfflineEgressBlocked" in ast.unparse(handler):
+                        continue  # handled explicitly inside
+                    hits.append((handler.lineno, lines[handler.lineno - 1].strip()))
+            if hits:
+                found[path.relative_to(PACKAGE_ROOT).as_posix()] = sorted(hits)
+        return found
+
+    def test_no_broad_handler_swallows_the_refusal(self) -> None:
+        problems: list[str] = []
+        found = self._broad_handlers()
+        for relpath, hits in found.items():
+            entry = self._ALLOWED.get(relpath)
+            if entry is None:
+                shown = "\n".join(f"        line {n}: {text}" for n, text in hits)
+                problems.append(f"  headroom/{relpath}\n{shown}")
+            elif len(hits) != entry[0]:
+                shown = "\n".join(f"        line {n}: {text}" for n, text in hits)
+                problems.append(
+                    f"  headroom/{relpath} — allowed {entry[0]} handler(s), found {len(hits)}"
+                    f"\n{shown}"
+                )
+        assert not problems, (
+            "A broad `except BaseException:` / bare `except:` can swallow "
+            "OfflineEgressBlocked.\n\n"
+            + "\n".join(problems)
+            + "\n\nOfflineEgressBlocked derives from BaseException so that no "
+            "`except Exception:` can degrade an air-gap refusal into 'that "
+            "feature stopped working'. A handler that catches BaseException "
+            "undoes that. Either:\n"
+            "  1. re-raise unconditionally (`raise` as the last statement), or\n"
+            "  2. add `except OfflineEgressBlocked: raise` ahead of it, or\n"
+            "  3. record it in _ALLOWED here with a written reason."
+        )
+
+    def test_allowed_reasons_are_written_out(self) -> None:
+        for relpath, (count, reason) in self._ALLOWED.items():
+            assert count > 0, relpath
+            assert len(reason) >= 40, f"{relpath}: reason is too thin to review"
+
+    def test_allowed_has_no_stale_entries(self) -> None:
+        found = self._broad_handlers()
+        stale = sorted(set(self._ALLOWED) - set(found))
+        assert not stale, f"entries with no broad handler left; delete them: {stale}"
+
+
+# ───────────────── startup refuses a contradictory configuration ────────────
+
+
+class TestStartupRefusal:
+    """An air-gap contradiction is a configuration error, so it is settled at
+    startup with the same shape ``_check_rust_core`` uses: say what, say how to
+    fix it, exit 78 (``EX_CONFIG``).
+
+    Before this, ``configure_otel_metrics`` was called OUTSIDE the lifespan's
+    ``try``, above the line that sets ``app.state.startup_error`` — so the
+    refusal escaped as an unhandled error out of ``lifespan`` and took down a
+    proxy that had been serving traffic, with a traceback instead of an
+    explanation. Only operators who set ``HEADROOM_OTEL_METRICS_ENABLED=1``
+    (default off) ever saw it, which is exactly the population that should not
+    have to read a stack trace to learn they set two contradictory flags.
+    """
+
+    def test_remote_kompress_contradiction_exits_78(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from headroom.proxy import server
+
+        monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "https://kompress.example.com")
+        with pytest.raises(SystemExit) as excinfo:
+            server._preflight_offline_egress()
+        assert excinfo.value.code == 78
+        message = capsys.readouterr().err
+        assert "HEADROOM_KOMPRESS_ENDPOINT" in message
+        assert "kompress.example.com" in message
+
+    def test_otlp_metrics_contradiction_exits_78(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from headroom.proxy import server
+
+        monkeypatch.delenv("HEADROOM_KOMPRESS_ENDPOINT", raising=False)
+        monkeypatch.setenv("HEADROOM_OTEL_METRICS_ENABLED", "1")
+        with pytest.raises(SystemExit) as excinfo:
+            server._configure_observability_or_refuse()
+        assert excinfo.value.code == 78
+        message = capsys.readouterr().err
+        # The operator has to leave with a next action, not just a refusal.
+        assert "HEADROOM_OTEL_METRICS_EXPORTER=console" in message
+
+    def test_langfuse_contradiction_exits_78(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from headroom.proxy import server
+
+        monkeypatch.delenv("HEADROOM_KOMPRESS_ENDPOINT", raising=False)
+        monkeypatch.delenv("HEADROOM_OTEL_METRICS_ENABLED", raising=False)
+        monkeypatch.setenv("HEADROOM_LANGFUSE_ENABLED", "1")
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk")
+        with pytest.raises(SystemExit) as excinfo:
+            server._configure_observability_or_refuse()
+        assert excinfo.value.code == 78
+        assert "HEADROOM_LANGFUSE_ENABLED" in capsys.readouterr().err
+
+    def test_an_air_gapped_proxy_with_no_egress_configured_starts(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The common case must stay a no-op — this is a refusal, not a new
+        reason for an air-gapped proxy to fail to boot."""
+        from headroom.proxy import server
+
+        for name in (
+            "HEADROOM_KOMPRESS_ENDPOINT",
+            "HEADROOM_OTEL_METRICS_ENABLED",
+            "HEADROOM_LANGFUSE_ENABLED",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        assert server._configure_observability_or_refuse() is None
+
+    def test_the_lifespan_routes_through_the_refusing_wrapper(self) -> None:
+        """The defect was one of placement, not of logic: the exporter call sat
+        outside the lifespan's own try. Pin that it now goes through the
+        wrapper, so a future edit cannot quietly move it back."""
+        from headroom.proxy import server
+
+        source = Path(server.__file__).read_text(encoding="utf-8")
+        assert "_configure_observability_or_refuse()" in source
+        lifespan_at = source.index("async def lifespan(")
+        body = source[lifespan_at:]
+        assert "configure_otel_metrics(" not in body, (
+            "lifespan calls configure_otel_metrics directly again; the "
+            "OfflineEgressBlocked it can raise is a BaseException and will "
+            "escape uvicorn as an unhandled error"
         )
 
 
