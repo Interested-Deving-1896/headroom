@@ -235,7 +235,21 @@ def test_ccr_backend_is_sqlite_when_not_stateless(monkeypatch, tmp_path):
 
 
 class _FakeExternalBackend:
-    """Stand-in for the registered `redis` CCR adapter: nothing on local disk."""
+    """Stand-in for the registered `redis` CCR adapter: nothing on local disk.
+
+    Declares `writes_local_disk = False` — the opt-in that keeps an external
+    backend under `--stateless`.
+    """
+
+    is_process_local = False
+    writes_local_disk = False
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _UndeclaredPluginBackend:
+    """A third-party backend that says nothing about where it puts originals."""
 
     is_process_local = False
 
@@ -243,7 +257,7 @@ class _FakeExternalBackend:
         self.kwargs = kwargs
 
 
-def _register_fake_external_backend(monkeypatch, name="redis"):
+def _register_fake_external_backend(monkeypatch, name="redis", factory=_FakeExternalBackend):
     import importlib.metadata as md
 
     class _EP:
@@ -251,7 +265,7 @@ def _register_fake_external_backend(monkeypatch, name="redis"):
             self.name = name
 
         def load(self):
-            return _FakeExternalBackend
+            return factory
 
     monkeypatch.setattr(md, "entry_points", lambda group=None: [_EP(name)])
 
@@ -281,6 +295,211 @@ def test_ccr_backend_writes_local_disk_classification():
     assert ccr_backend_writes_local_disk(" SQLite ") is True
     assert ccr_backend_writes_local_disk("memory") is False
     assert ccr_backend_writes_local_disk("redis") is False
+
+
+def test_stateless_rejects_an_undeclared_plugin_backend(monkeypatch):
+    """A plugin backend that never says where originals go fails closed.
+
+    ``is_process_local = False`` alone does not distinguish "remote store" from
+    "writes a file next to the proxy". Under stateless mode the safe reading is
+    the second one; an adapter that stores off-machine opts in with
+    ``writes_local_disk = False``.
+    """
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "mystery")
+    _register_fake_external_backend(monkeypatch, "mystery", _UndeclaredPluginBackend)
+    from headroom.cache.compression_store import _create_default_ccr_backend
+
+    paths.set_process_stateless(True)
+    assert _create_default_ccr_backend() is None
+
+    # Control: outside stateless mode the plugin backend is used as configured.
+    paths.set_process_stateless(False)
+    assert isinstance(_create_default_ccr_backend(), _UndeclaredPluginBackend)
+
+
+def test_backend_is_stateless_safe_classification(tmp_path):
+    from headroom.cache.backends.memory import InMemoryBackend
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import backend_is_stateless_safe
+
+    assert backend_is_stateless_safe(None) is True
+    assert backend_is_stateless_safe(InMemoryBackend()) is True
+    assert backend_is_stateless_safe(_FakeExternalBackend()) is True
+    assert backend_is_stateless_safe(_UndeclaredPluginBackend()) is False
+    sqlite_backend = SQLiteBackend(tmp_path / "ccr_store.db")
+    try:
+        assert backend_is_stateless_safe(sqlite_backend) is False
+    finally:
+        sqlite_backend.close()
+
+
+# ---- the enforcement boundary: stateless beats EVERY backend choice --------
+#
+# `_create_default_ccr_backend()` is consulted only when this process builds
+# the *unconfigured global* store. `get_compression_store()` has two other
+# ways to hand back a persistent store -- a request-scoped (SaaS per-tenant)
+# store and an explicit `backend=` argument -- and both can be created long
+# after stateless mode was turned on. Enforcement therefore lives at the
+# accessor, not at the default-backend factory.
+
+
+@pytest.fixture
+def _reset_request_ccr_store():
+    from headroom.cache.compression_store import clear_request_compression_store
+
+    clear_request_compression_store()
+    yield
+    clear_request_compression_store()
+
+
+def test_stateless_enforced_on_an_explicit_backend_argument(tmp_path, _reset_ccr_store):
+    """`get_compression_store(backend=SQLiteBackend(...))` never reaches the factory."""
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import get_compression_store
+
+    db = tmp_path / "ccr_store.db"
+    paths.set_process_stateless(True)
+
+    store = get_compression_store(backend=SQLiteBackend(db))
+
+    assert store.backend_is_process_local is True
+    secret = "SECRET-VIA-EXPLICIT-BACKEND-" + ("x" * 256)
+    store.store(secret, "[compressed]", tool_name="Bash")
+    assert not any(secret in row for row in _sqlite_rows(db)), (
+        "an explicitly supplied SQLite backend bypassed stateless mode"
+    )
+
+
+def test_explicit_backend_is_honoured_when_not_stateless(tmp_path, _reset_ccr_store):
+    """Control: outside stateless mode an explicit backend is used as given."""
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import get_compression_store
+
+    db = tmp_path / "ccr_store.db"
+    paths.set_process_stateless(False)
+
+    store = get_compression_store(backend=SQLiteBackend(db))
+    store.store("kept-on-disk", "[compressed]", tool_name="Bash")
+
+    assert store.backend_is_process_local is False
+    assert any("kept-on-disk" in row for row in _sqlite_rows(db))
+
+
+def test_stateless_enforced_on_a_request_store_created_later(
+    tmp_path, _reset_ccr_store, _reset_request_ccr_store
+):
+    """The SaaS path: a per-tenant store built per request, after startup.
+
+    `make_compression_store_stateless()` runs once at proxy construction and
+    cannot see this store, so the accessor has to.
+    """
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        get_compression_store,
+        set_request_compression_store,
+    )
+
+    db = tmp_path / "tenant.db"
+    paths.set_process_stateless(True)
+
+    tenant_store = CompressionStore(backend=SQLiteBackend(db))
+    set_request_compression_store(tenant_store)
+
+    active = get_compression_store()
+    assert active is tenant_store, "the store object must not be replaced"
+    assert active.backend_is_process_local is True
+
+    secret = "SECRET-VIA-TENANT-STORE-" + ("x" * 256)
+    active.store(secret, "[compressed]", tool_name="Bash")
+    assert not any(secret in row for row in _sqlite_rows(db)), (
+        "a request-scoped SQLite store bypassed stateless mode"
+    )
+
+
+def test_request_store_is_enforced_at_installation(
+    tmp_path, _reset_ccr_store, _reset_request_ccr_store
+):
+    """Middleware that keeps its own reference must not bypass the accessor."""
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        set_request_compression_store,
+    )
+
+    db = tmp_path / "tenant.db"
+    paths.set_process_stateless(True)
+
+    tenant_store = CompressionStore(backend=SQLiteBackend(db))
+    set_request_compression_store(tenant_store)
+
+    # Written through the middleware's own handle; get_compression_store() is
+    # never called.
+    secret = "SECRET-VIA-CAPTURED-TENANT-STORE-" + ("x" * 256)
+    tenant_store.store(secret, "[compressed]", tool_name="Bash")
+    assert not any(secret in row for row in _sqlite_rows(db))
+
+
+def test_request_store_is_untouched_when_not_stateless(
+    tmp_path, _reset_ccr_store, _reset_request_ccr_store
+):
+    """Control: a tenant store keeps its persistent backend outside stateless."""
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        get_compression_store,
+        set_request_compression_store,
+    )
+
+    db = tmp_path / "tenant.db"
+    paths.set_process_stateless(False)
+
+    tenant_store = CompressionStore(backend=SQLiteBackend(db))
+    set_request_compression_store(tenant_store)
+    get_compression_store().store("tenant-row", "[compressed]", tool_name="Bash")
+
+    assert tenant_store.backend_is_process_local is False
+    assert any("tenant-row" in row for row in _sqlite_rows(db))
+
+
+def test_stateless_keeps_a_declared_external_request_store(
+    _reset_ccr_store, _reset_request_ccr_store
+):
+    """The escape hatch works at the boundary too, not just via the env var.
+
+    A tenant store on a remote backend is how a stateless SaaS deployment keeps
+    retrieval working across workers; the boundary must not downgrade it.
+    """
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        get_compression_store,
+        set_request_compression_store,
+    )
+
+    paths.set_process_stateless(True)
+    tenant_store = CompressionStore(backend=_FakeExternalBackend())
+    set_request_compression_store(tenant_store)
+
+    assert get_compression_store() is tenant_store
+    assert tenant_store.backend_class_name == "_FakeExternalBackend"
+
+
+def test_stateless_swaps_an_undeclared_plugin_request_store(
+    _reset_ccr_store, _reset_request_ccr_store
+):
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        get_compression_store,
+        set_request_compression_store,
+    )
+
+    paths.set_process_stateless(True)
+    tenant_store = CompressionStore(backend=_UndeclaredPluginBackend())
+    set_request_compression_store(tenant_store)
+
+    assert get_compression_store() is tenant_store
+    assert tenant_store.backend_is_process_local is True
 
 
 # ---- (1) the stateless swap must not destroy the shared database -----------
@@ -338,6 +557,44 @@ def test_stateless_apply_stops_an_already_captured_store_writing_to_disk(
         "the captured store went on writing verbatim originals to disk"
     )
     assert captured.backend_is_process_local is True
+
+
+def test_stateless_lifecycle_for_an_already_persistent_singleton(tmp_path, _reset_ccr_store):
+    """The documented transition, asserted end to end (see `ccr.mdx`).
+
+    A process that already holds a SQLite-backed store builds a stateless
+    proxy. Every clause of the lifecycle is a deliberate choice:
+
+    1. the store object survives -- no rebuild, so captured references follow;
+    2. the shared database is never `clear()`ed;
+    3. rows written before the switch stay on disk: `--stateless` stops new
+       writes, it does not retroactively purge an earlier stateful run;
+    4. entries held in memory are dropped, not migrated;
+    5. writes after the switch go nowhere near the file.
+    """
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import get_compression_store
+    from headroom.proxy.server import ProxyConfig, _apply_stateless_persistence
+
+    db = tmp_path / "ccr_store.db"
+    paths.set_process_stateless(False)
+    store = get_compression_store(backend=SQLiteBackend(db))
+    hash_key = store.store("written-while-stateful", "[compressed]", tool_name="Bash")
+    assert store.retrieve(hash_key) is not None
+
+    # Proxy construction order: record the mode, then retarget the persisters.
+    paths.set_process_stateless(True)
+    _apply_stateless_persistence(ProxyConfig(stateless=True))
+
+    assert get_compression_store() is store, "(1) the store object was rebuilt"
+    rows = _sqlite_rows(db)
+    assert len(rows) == 1, "(2) the shared database was cleared"
+    assert "written-while-stateful" in rows[0], "(3) an earlier stateful run was purged"
+    assert store.retrieve(hash_key) is None, "(4) pre-switch entries were carried over"
+
+    secret = "SECRET-AFTER-SWITCH-" + ("x" * 256)
+    store.store(secret, "[compressed]", tool_name="Bash")
+    assert not any(secret in row for row in _sqlite_rows(db)), "(5) still writing to disk"
 
 
 def test_use_process_local_backend_is_idempotent(_reset_ccr_store):

@@ -34,6 +34,15 @@ class CompressionStoreBackend(Protocol):
       in this process: not shared with other workers, gone on restart. Drives
       the retrieval-miss diagnostics, so a miss is not blamed on TTL when the
       real cause is that the entry was stored by a different worker.
+    - ``writes_local_disk: bool`` (no default -- undeclared fails closed) --
+      set it to ``False`` to declare that this backend keeps nothing on the
+      host filesystem (a remote store: Redis, MongoDB, an HTTP service).
+      ``--stateless`` / ``HEADROOM_STATELESS`` keeps such a backend, since the
+      promise is about *this machine's* disk and an off-machine store is the
+      only way to share retrieval across workers. A backend that does not
+      declare it is swapped for the in-process one under stateless mode:
+      verbatim tool-result originals are the payload at stake, and from the
+      outside there is no way to tell where an undeclared backend puts them.
     - ``close() -> None`` -- release the backend's handles without destroying
       stored entries. Called when stateless mode swaps a backend out.
 

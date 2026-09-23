@@ -36,6 +36,7 @@ class InMemoryBackend:
     # with other workers, nothing surviving a restart. Read by stateless mode
     # and by the retrieval-miss diagnostics.
     is_process_local = True
+    writes_local_disk = False
 
     def __init__(self) -> None:
         """Initialize the in-memory backend."""

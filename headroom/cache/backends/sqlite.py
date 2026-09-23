@@ -79,6 +79,7 @@ class SQLiteBackend:
     # Entries land in a local file, so stateless mode must not use this
     # backend. Read by stateless mode and the retrieval-miss diagnostics.
     is_process_local = False
+    writes_local_disk = True
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._path = Path(db_path).expanduser() if db_path else default_db_path()
