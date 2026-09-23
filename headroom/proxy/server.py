@@ -2992,15 +2992,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
-    # it, force HF/transformers offline before any model code loads, and
-    # announce that every outbound path is disabled.
+    # it, force HF/transformers offline before any model code loads, and say
+    # what is covered. The banner deliberately stops short of promising a
+    # whole-process kill switch: some install-time and opt-in-cloud paths are
+    # still unguarded (enumerated in tests/test_offline_egress_chokepoint.py),
+    # and an operator who reads this line as a guarantee may skip the firewall
+    # rule that is still the only hard one. TestDocsMatchTheGuarantee scans
+    # this file for the stronger phrasings and fails while any remain.
     if config.offline:
         os.environ.setdefault("HEADROOM_OFFLINE", "1")
     if is_offline():
         apply_offline_env()
         logger.warning(
-            "event=proxy_offline_mode air-gap active — all outbound egress disabled "
-            "(telemetry, update check, license reporter, HuggingFace downloads)"
+            "event=proxy_offline_mode air-gap active — Headroom-initiated egress is "
+            "blocked (telemetry, update check, license reporter, HuggingFace "
+            "downloads, remote Kompress, OTLP/Langfuse export). Forwarding your "
+            "requests to the configured upstream is unaffected; some install-time "
+            "and opt-in-cloud paths are not covered yet."
         )
 
     proxy = HeadroomProxy(config)

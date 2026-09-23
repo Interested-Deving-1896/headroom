@@ -1435,6 +1435,9 @@ class TestSiteScannerRules:
 _AIR_GAP_DOCS = (
     "docs/metrics-technical-guide.md",
     "docs/content/docs/proxy.mdx",
+    # Not a doc, but the same promise made to the same reader: the startup
+    # banner an operator sees when they turn the switch on.
+    "headroom/proxy/server.py",
 )
 
 # Phrases that promise a whole-process egress kill switch. Fine to write once
@@ -1446,6 +1449,7 @@ _OVERCLAIMS = (
     "hard-disable **all** egress",
     "hard-disables all egress",
     "no outbound traffic at all",
+    "all outbound egress disabled",
 )
 
 
