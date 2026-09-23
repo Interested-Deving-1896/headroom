@@ -138,8 +138,13 @@ impl HfTokenizer {
         // The refusal is hard on purpose. Silently returning a cached or
         // estimating tokenizer would leave token counts subtly wrong with no
         // signal; the caller (`tokenizer::registry::try_register_hf`) already
-        // propagates the error so the operator sees which repo was wanted and
-        // can pre-seed `~/.cache/huggingface/hub` or use `from_file`.
+        // propagates the error so the operator sees which repo was wanted.
+        //
+        // Note it refuses even on a warm cache: `hf-hub` 0.5 exposes no
+        // cache-hit/cache-miss split at this layer, so "guard before the
+        // client exists" and "serve from the cache" cannot both hold here. An
+        // air-gapped deployment with pre-seeded artifacts should point at them
+        // with `from_file`, which is network-free by construction.
         crate::offline::guard_egress("HuggingFace tokenizer download", repo)?;
         let api = hf_hub::api::sync::Api::new().map_err(|e| HfTokenizerError::Hub {
             repo: repo.to_string(),
