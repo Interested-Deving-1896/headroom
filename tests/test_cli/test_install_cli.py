@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from headroom.cli import install as inst
 from headroom.cli.main import main
+from headroom.install.planner import build_tool_envs
 
 
 def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
@@ -567,7 +568,7 @@ def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
         targets = ["claude"]
         port = 8787
         backend = "anthropic"
-        tool_envs = {}
+        tool_envs = build_tool_envs(8787, "anthropic", ["claude"])
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -596,7 +597,7 @@ def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypat
         targets = ["claude"]
         port = 8787
         backend = "anthropic"
-        tool_envs = {}
+        tool_envs = build_tool_envs(8787, "anthropic", ["claude"])
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -1439,3 +1440,85 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code != 0, f"expected non-zero exit, got {result.exit_code}: {result.output}"
     assert "simulated start failure" in result.output
+
+
+def test_install_start_reconciles_a_healthy_deployment(monkeypatch) -> None:
+    """The regression this whole change exists for.
+
+    ``install start`` activated mutations only when the deployment had NONE
+    recorded. A normally-installed, working deployment always has some, so the
+    reconcile never ran on the one command the affected users actually type --
+    and the stale env var stayed stale forever.
+    """
+    runner = CliRunner()
+    applied: list[str] = []
+
+    class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        # Pre-#746: base URL written, tool search never enabled.
+        tool_envs = {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations = [object()]  # healthy AND already mutated: the skipped case
+        artifacts = []
+
+    manifest = Manifest()
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: manifest)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.apply_mutations", lambda m: applied.append("apply") or []
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda m, timeout_seconds=None: True)
+
+    result = runner.invoke(main, ["install", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert "ENABLE_TOOL_SEARCH" in manifest.tool_envs["claude"]
+    assert applied == ["apply"]  # re-applied so the new key reaches the config
+
+
+def test_install_start_still_skips_when_nothing_is_pending(monkeypatch) -> None:
+    """A deployment that is already current must not be perturbed."""
+    runner = CliRunner()
+    applied: list[str] = []
+
+    class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs: dict = {}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations = [object()]
+        artifacts = []
+
+    manifest = Manifest()
+    from headroom.cli.install import _reconcile_tool_envs
+
+    _reconcile_tool_envs(manifest)  # bring it fully up to date first
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: manifest)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.apply_mutations", lambda m: applied.append("apply") or []
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda m, timeout_seconds=None: True)
+
+    result = runner.invoke(main, ["install", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert applied == []

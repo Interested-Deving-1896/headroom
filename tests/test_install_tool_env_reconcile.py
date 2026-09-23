@@ -14,7 +14,7 @@ without the mitigation -- the expensive half of the change, indefinitely.
 
 from __future__ import annotations
 
-from headroom.cli.install import _reconcile_tool_envs
+from headroom.cli.install import _reconcile_tool_envs, pending_tool_envs
 from headroom.install.models import DeploymentManifest
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 
@@ -117,3 +117,47 @@ def test_the_rebuilt_base_url_uses_the_manifest_port() -> None:
     _reconcile_tool_envs(manifest)
 
     assert "9123" in manifest.tool_envs[CLAUDE]["ANTHROPIC_BASE_URL"]
+
+
+def test_a_non_dict_entry_does_not_crash_a_lifecycle_command() -> None:
+    """A hand-edited manifest must not turn ``install restart`` into a traceback.
+
+    ``load_manifest`` does not type-check ``tool_envs``, so a string here
+    reached ``stored.update(...)`` and raised AttributeError from a path with
+    no handler.
+    """
+    manifest = _manifest({CLAUDE: "http://127.0.0.1:8787"})  # type: ignore[dict-item]
+
+    added = _reconcile_tool_envs(manifest)
+
+    assert isinstance(manifest.tool_envs[CLAUDE], dict)
+    assert TOOL_SEARCH_ENV in manifest.tool_envs[CLAUDE]
+    assert added.get(CLAUDE)
+
+
+def test_a_target_with_no_managed_env_is_not_written() -> None:
+    """No silent manifest churn: a no-op reconcile must not rewrite the file."""
+    manifest = _manifest({})
+    manifest.targets = [CLAUDE, "opencode"]
+
+    _reconcile_tool_envs(manifest)
+
+    assert "opencode" not in manifest.tool_envs
+
+
+def test_pending_does_not_mutate() -> None:
+    """The lifecycle commands ask before deciding; asking must be free."""
+    manifest = _manifest({})
+    before = {k: dict(v) for k, v in manifest.tool_envs.items()}
+
+    pending = pending_tool_envs(manifest)
+
+    assert pending  # there IS something to do
+    assert manifest.tool_envs == before  # ...but nothing was done
+
+
+def test_pending_is_empty_once_reconciled() -> None:
+    manifest = _manifest({})
+    _reconcile_tool_envs(manifest)
+
+    assert pending_tool_envs(manifest) == {}
