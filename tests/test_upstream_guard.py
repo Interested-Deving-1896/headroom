@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import re
 import socket
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -152,7 +154,7 @@ class _InternalService:
         return f"http://127.0.0.1:{self.port}"
 
 
-def _app():  # noqa: ANN202
+def _app(**overrides: object):  # noqa: ANN202
     return create_app(
         ProxyConfig(
             host="127.0.0.1",
@@ -160,6 +162,7 @@ def _app():  # noqa: ANN202
             optimize=False,
             cache_enabled=False,
             rate_limit_enabled=False,
+            **overrides,  # type: ignore[arg-type]
         )
     )
 
@@ -298,3 +301,333 @@ async def test_async_guard_matches_the_sync_policy() -> None:
     assert await is_safe_upstream_url_async("http://127.0.0.1/") is False
     assert await is_safe_upstream_url_async("http://169.254.169.254/") is False
     assert await is_safe_upstream_url_async("https://8.8.8.8/v1") is True
+
+
+# ---------------------------------------------------------------------------
+# DNS rebinding (A-4).
+#
+# The guard used to resolve the hostname, judge the answer, and then hand the
+# *name* to httpx -- which resolves it a second time when it opens the socket.
+# An attacker who controls the authoritative DNS for that name simply answers
+# the two lookups differently: a public address for the check, an internal one
+# for the connection. Every check above still passes while the proxy talks to
+# 127.0.0.1, so the tests here assert on where the socket actually went rather
+# than on what `is_safe_upstream_url` returned.
+# ---------------------------------------------------------------------------
+
+
+# A path no route claims, so it lands on the catch-all passthrough -- the sink
+# that forwards to `x-headroom-base-url` verbatim once the guard has cleared it.
+_PROBE_PATH = "/v1/rebind-probe"
+
+
+class _RebindingResolver:
+    """A `getaddrinfo` that answers the first lookup differently from the rest.
+
+    Only the attacker-controlled hostname is intercepted; every other name is
+    delegated to the real resolver, so patching this in globally -- which is
+    what it takes to reach asyncio's own resolution, not just the guard's --
+    leaves the rest of the process alone.
+    """
+
+    def __init__(self, hostname: str, first: str, then: str) -> None:
+        self.hostname = hostname
+        self.first = first
+        self.then = then
+        self.calls = 0
+        self._real = socket.getaddrinfo
+        self._lock = threading.Lock()
+
+    def __call__(self, host: object, port: object, *args: object, **kwargs: object) -> list:
+        # anyio hands the resolver an ASCII/IDNA-encoded name, the guard a str.
+        name = host.decode("ascii") if isinstance(host, bytes) else host
+        if name != self.hostname:
+            return self._real(host, port, *args, **kwargs)  # type: ignore[arg-type]
+        with self._lock:
+            self.calls += 1
+            address = self.first if self.calls == 1 else self.then
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port or 0),
+            )
+        ]
+
+
+def test_rebinding_after_the_check_cannot_move_the_forward_to_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validated address is the one dialled, not whatever DNS says later.
+
+    The first lookup (the guard's) answers with a public address so the URL
+    passes validation; every later one answers with the internal service.
+    Before the pin, httpx re-resolved and delivered both the request and the
+    response to loopback.
+    """
+    resolver = _RebindingResolver("rebind.example", first="8.8.8.8", then="127.0.0.1")
+    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+
+    with (
+        _InternalService() as internal,
+        TestClient(_app(connect_timeout_seconds=1)) as client,
+    ):
+        try:
+            response = client.post(
+                _PROBE_PATH,
+                headers={"x-headroom-base-url": f"http://rebind.example:{internal.port}"},
+                json={"query": "x"},
+            )
+            status, text = response.status_code, response.text
+        except Exception as exc:  # noqa: BLE001 - an upstream failure is a pass here
+            status, text = 0, repr(exc)
+
+    assert resolver.calls >= 1, "the guard never resolved the hostname"
+    assert status != 400, f"the guard rejected the URL; the pin was never exercised: {text}"
+    assert status != 404, f"the route did not forward at all: {text}"
+    assert internal.hits == [], "the connection followed the rebound answer to loopback"
+    assert "internal-only" not in text
+
+
+def _self_signed_cert(tmp_path: Path, hostname: str) -> tuple[str, str]:
+    """Write a self-signed leaf for ``hostname``; return (cert path, key path).
+
+    The certificate is its own issuer, so the same file doubles as the trust
+    bundle the proxy is pointed at through ``SSL_CERT_FILE``.
+    """
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+    now = datetime.datetime.now(datetime.UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return str(cert_path), str(key_path)
+
+
+class _TLSUpstream:
+    """An HTTPS upstream on loopback that records the SNI and Host it was sent."""
+
+    def __init__(self, cert_pem: str, key_pem: str) -> None:
+        self.sni: list[str | None] = []
+        self.host_headers: list[str] = []
+        host_headers = self.host_headers
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                host_headers.append(self.headers.get("Host", ""))
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST  # noqa: N815
+
+            def log_message(self, *args: object) -> None:
+                return
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_pem, key_pem)
+        context.sni_callback = lambda _sock, name, _ctx: self.sni.append(name)
+        self._server = HTTPServer(("127.0.0.1", 0), _Handler)
+        self._server.socket = context.wrap_socket(self._server.socket, server_side=True)
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _TLSUpstream:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+
+
+def _tls_rebinding_app(
+    monkeypatch: pytest.MonkeyPatch,
+    resolver: _RebindingResolver,
+    ca_pem: str,
+):  # noqa: ANN202
+    """Point the proxy at ``ca_pem`` and at ``resolver``'s answers.
+
+    ``_is_internal_address`` is neutered so a loopback answer passes
+    validation: the subject of these two tests is what happens *after* an
+    address is accepted, and faking it this way keeps the upstream on 127.0.0.1
+    instead of requiring real egress to a genuinely public address.
+    """
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+    monkeypatch.setattr(upstream_guard, "_is_internal_address", lambda _ip: False)
+    monkeypatch.setenv("SSL_CERT_FILE", ca_pem)
+    return _app(connect_timeout_seconds=1)
+
+
+def test_pinned_connection_presents_the_original_hostname_to_tls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Dialling an IP literal must not cost us SNI, the Host header, or the cert.
+
+    The upstream's certificate names `pinned.example` only, so a handshake
+    verified against the pinned address -- or one that relaxed verification to
+    make pinning work at all -- fails here. And because the second DNS answer
+    points off-box, a request arriving at all is proof the first, validated
+    answer is what was dialled.
+    """
+    cert_pem, key_pem = _self_signed_cert(tmp_path, "pinned.example")
+    resolver = _RebindingResolver("pinned.example", first="127.0.0.1", then="8.8.8.8")
+
+    with _TLSUpstream(cert_pem, key_pem) as upstream:
+        app = _tls_rebinding_app(monkeypatch, resolver, cert_pem)
+        with TestClient(app) as client:
+            try:
+                status = client.post(
+                    _PROBE_PATH,
+                    headers={"x-headroom-base-url": f"https://pinned.example:{upstream.port}"},
+                    json={"query": "x"},
+                ).status_code
+            except Exception as exc:  # noqa: BLE001
+                pytest.fail(f"pinned TLS request never reached the upstream: {exc!r}")
+
+    assert status == 200, "the pinned upstream was not reached"
+    assert upstream.sni == ["pinned.example"], f"wrong SNI: {upstream.sni}"
+    assert upstream.host_headers, "no request arrived at the pinned upstream"
+    assert upstream.host_headers[0].startswith("pinned.example"), (
+        f"Host header was rewritten to the pinned address: {upstream.host_headers[0]}"
+    )
+
+
+def test_pinning_does_not_disable_certificate_hostname_verification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The mirror of the test above: a cert for the wrong name must still fail.
+
+    Identical setup with one difference -- the upstream's certificate names
+    `other.example` while the caller asked for `pinned.example`. Pinning
+    implemented by rewriting the URL to the address without carrying the
+    hostname into the handshake, or by loosening `verify`, would pass this
+    request straight through.
+    """
+    cert_pem, key_pem = _self_signed_cert(tmp_path, "other.example")
+    resolver = _RebindingResolver("pinned.example", first="127.0.0.1", then="8.8.8.8")
+
+    with _TLSUpstream(cert_pem, key_pem) as upstream:
+        app = _tls_rebinding_app(monkeypatch, resolver, cert_pem)
+        with TestClient(app) as client:
+            try:
+                status = client.post(
+                    _PROBE_PATH,
+                    headers={"x-headroom-base-url": f"https://pinned.example:{upstream.port}"},
+                    json={"query": "x"},
+                ).status_code
+            except Exception:  # noqa: BLE001 - a refused handshake is the pass
+                status = 0
+
+    assert status != 200, "a certificate for the wrong hostname was accepted"
+    assert upstream.host_headers == [], "the request reached a mis-named upstream"
+
+
+def test_a_check_pins_every_address_it_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All of them, in resolver order -- see the IPv6-fallback note on the pin."""
+    from headroom.proxy import upstream_guard
+
+    def two_answers(*args: object, **kwargs: object) -> list[object]:
+        return [
+            (None, None, None, None, ("8.8.8.8", 443)),
+            (None, None, None, None, ("1.1.1.1", 443)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", two_answers)
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://Multi.Homed.Example/v1") is True
+    # Hostnames are case-insensitive; the connection will ask in lower case.
+    assert upstream_guard.validated_addresses("multi.homed.example") == ("8.8.8.8", "1.1.1.1")
+
+
+def test_a_rejected_or_allowlisted_destination_pins_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an address that was judged may be pinned.
+
+    A rejected destination is never dialled, and an allowlisted one is admitted
+    by name without resolving at all -- pinning either would be recording a
+    verdict that was not reached.
+    """
+    from headroom.proxy import upstream_guard
+
+    def internal_answer(*args: object, **kwargs: object) -> list[object]:
+        return [(None, None, None, None, ("10.1.2.3", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", internal_answer)
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://rejected.example/v1") is False
+    assert upstream_guard.validated_addresses("rejected.example") is None
+
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.internal")
+    assert is_safe_upstream_url("https://gateway.internal/v1") is True
+    assert upstream_guard.validated_addresses("gateway.internal") is None
+
+
+def test_a_pin_expires_rather_than_outliving_the_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An aged-out pin is absent, which is plain resolution -- never a denial."""
+    from headroom.proxy import upstream_guard
+
+    def public_answer(*args: object, **kwargs: object) -> list[object]:
+        return [(None, None, None, None, ("8.8.8.8", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", public_answer)
+    monkeypatch.setattr(upstream_guard, "_PIN_TTL_SECONDS", 0.0)
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://briefly.example/v1") is True
+    assert upstream_guard.validated_addresses("briefly.example") is None
+    assert "briefly.example" not in upstream_guard._PINS, "expired pins must not accumulate"
+
+
+def test_the_pin_store_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hostnames are caller-supplied, so the store cannot grow without limit."""
+    from headroom.proxy import upstream_guard
+
+    def public_answer(*args: object, **kwargs: object) -> list[object]:
+        return [(None, None, None, None, ("8.8.8.8", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", public_answer)
+    monkeypatch.setattr(upstream_guard, "_PIN_MAX_ENTRIES", 4)
+    upstream_guard.clear_validated_addresses()
+
+    for index in range(20):
+        assert is_safe_upstream_url(f"https://flood{index}.example/v1") is True
+
+    assert len(upstream_guard._PINS) == 4
+    assert upstream_guard.validated_addresses("flood19.example") == ("8.8.8.8",)
+    assert upstream_guard.validated_addresses("flood0.example") is None

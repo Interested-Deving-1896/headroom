@@ -14,6 +14,12 @@ Policy:
     only their exact normalized origin. Because that is an explicit operator
     choice, allowlisted destinations may point at internal/on-prem endpoints.
 
+Answering "is this safe?" is only half the job: the answer has to survive to the
+socket. Every accepted destination therefore has the addresses it was judged on
+recorded here (see :func:`validated_addresses`), and the proxy's HTTP client
+dials one of *those* instead of resolving the name a second time —
+``headroom/proxy/upstream_pinning.py`` is the connect-time half.
+
 This module intentionally depends only on the standard library so it is safe to
 import from any handler without risking an import cycle.
 """
@@ -24,6 +30,8 @@ import asyncio
 import ipaddress
 import os
 import socket
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
 from urllib.parse import urlparse
@@ -53,6 +61,80 @@ def _resolve_timeout_seconds() -> float:
 
 
 _SAFE_SCHEMES = {"http", "https", "ws", "wss"}
+
+# Pinning the addresses a check was made against.
+#
+# `socket.getaddrinfo` below and the HTTP client's own lookup at connect time
+# are two separate resolutions of the same name, and an attacker who controls
+# its authoritative DNS answers them differently: a public address for the
+# check, 169.254.169.254 (or an RFC1918 host) for the connection. That is DNS
+# rebinding, and it makes a verdict based only on the first answer advisory --
+# the socket never sees it. So the addresses that were actually judged are
+# recorded here for the connection to dial.
+#
+# The window is short on purpose, and deliberately not configurable: a pin only
+# has to bridge the microseconds between a check and the connection it
+# authorises, while an operator who stretched it to hours would be pinning
+# legitimate upstreams to addresses they have since moved off. An expired pin is
+# simply absent, which returns that host to ordinary resolution -- exactly the
+# behaviour every unchecked host already has -- and the next request through the
+# guard re-validates and re-pins it.
+_PIN_TTL_SECONDS = 60.0
+# Hostnames here are caller-supplied, so the store is bounded; least recently
+# written out first.
+_PIN_MAX_ENTRIES = 512
+_PIN_LOCK = threading.Lock()
+_PINS: dict[str, tuple[float, tuple[str, ...]]] = {}
+
+
+def _record_validated_addresses(host: str, addresses: tuple[str, ...]) -> None:
+    """Remember what ``host`` was judged on, for the connection that follows."""
+    if not host or not addresses:
+        return
+    expires_at = time.monotonic() + _PIN_TTL_SECONDS
+    with _PIN_LOCK:
+        # Re-insert rather than update so dict order stays write order, which is
+        # what the eviction below pops from.
+        _PINS.pop(host, None)
+        _PINS[host] = (expires_at, addresses)
+        while len(_PINS) > _PIN_MAX_ENTRIES:
+            _PINS.pop(next(iter(_PINS)))
+
+
+def validated_addresses(host: str) -> tuple[str, ...] | None:
+    """Return the addresses a recent check accepted for ``host``, if any.
+
+    ``None`` means "not this module's business", never "unsafe": the host may
+    simply never have been checked -- configured provider upstreams are not
+    client-supplied and never pass through here -- or its pin may have aged out.
+    Whether a destination is allowed at all is :func:`is_safe_upstream_url`'s
+    answer, not this one's.
+    """
+    # Every upstream connection the proxy opens asks this question, while only
+    # deployments that actually accept `x-headroom-base-url` ever have an answer
+    # -- so get the empty case out of the way without taking the lock. Reading a
+    # dict's truthiness is atomic, and a pin landing concurrently is one the
+    # caller could not have been waiting on anyway.
+    if not _PINS:
+        return None
+    key = (host or "").strip().lower()
+    if not key:
+        return None
+    with _PIN_LOCK:
+        entry = _PINS.get(key)
+        if entry is None:
+            return None
+        expires_at, addresses = entry
+        if expires_at <= time.monotonic():
+            del _PINS[key]
+            return None
+    return addresses
+
+
+def clear_validated_addresses() -> None:
+    """Drop every pin. For tests and for a proxy restarting its HTTP clients."""
+    with _PIN_LOCK:
+        _PINS.clear()
 
 
 def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | None:
@@ -138,6 +220,13 @@ def is_safe_upstream_url(url: str) -> bool:
     In allowlist mode only allowlisted hosts pass. Otherwise the host is
     resolved and rejected if any resolved address is internal/metadata, which
     also catches DNS names that point at private space.
+
+    A destination accepted on its addresses also has them pinned, so the
+    connection that follows cannot be re-pointed by a second DNS answer.
+    Allowlist mode pins nothing: it admits a host by name without resolving it
+    at all, precisely so split-horizon and on-prem endpoints -- whose addresses
+    are the operator's business, and may legitimately move or round-robin --
+    keep working.
     """
     parsed = urlparse((url or "").strip())
     if parsed.scheme.lower() not in _SAFE_SCHEMES:
@@ -169,7 +258,17 @@ def is_safe_upstream_url(url: str) -> bool:
         # A lookup that overruns the budget is treated the same way.
         # Operators can explicitly allowlist split-horizon/internal endpoints.
         return False
-    return all(not _is_internal_address(str(info[4][0])) for info in infos)
+    addresses = tuple(dict.fromkeys(str(info[4][0]) for info in infos))
+    if any(_is_internal_address(address) for address in addresses):
+        return False
+    # Every address in this answer passed, so pin them all: the connection may
+    # dial any one of them and still be dialling something this check accepted.
+    # Keeping the whole set (in resolver order) rather than a single winner
+    # leaves the connection somewhere to go when the first address is an AAAA on
+    # a host with no IPv6 route -- the fallback the OS resolver would otherwise
+    # have done for us.
+    _record_validated_addresses(host.lower(), addresses)
+    return True
 
 
 async def is_safe_upstream_url_async(url: str) -> bool:

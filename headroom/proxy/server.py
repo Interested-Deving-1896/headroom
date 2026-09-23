@@ -173,6 +173,7 @@ from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -1955,11 +1956,21 @@ class HeadroomProxy(
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
         _verify = build_httpx_verify()
         _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
-        self.http_client = httpx.AsyncClient(http2=_http2, **_client_kwargs)
+        # `install_upstream_pinning` is what makes the SSRF guard's verdict
+        # binding: a caller-supplied upstream that passed `is_safe_upstream_url`
+        # is dialled at the address that was checked, instead of being resolved
+        # a second time here (DNS rebinding). It swaps the pool's DNS layer only
+        # — the clients themselves are built exactly as before, so proxies,
+        # trust_env, limits, HTTP/2 and connection reuse are unchanged.
+        self.http_client = install_upstream_pinning(
+            httpx.AsyncClient(http2=_http2, **_client_kwargs)
+        )
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
-            self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
+            self.http_client
+            if not _http2
+            else install_upstream_pinning(httpx.AsyncClient(http2=False, **_client_kwargs))
         )
         logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
