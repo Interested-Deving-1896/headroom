@@ -3600,10 +3600,63 @@ def request_already_defers_tools(tools: Any) -> bool:
     deferral is the only one available.
     """
 
+    deferred_without_search_tool = False
     for tool in iter_tool_entries(tools):
-        if tool.get("defer_loading") is True or _is_tool_search_meta_tool(tool):
+        if _is_tool_search_meta_tool(tool):
             return True
+        if tool.get("defer_loading") is True:
+            deferred_without_search_tool = True
+    if deferred_without_search_tool:
+        # Tools marked deferred with no meta-tool we recognize that could
+        # resolve them. Two very different causes, and the operator wants to
+        # know which: a harness whose search tool is spelled in a way this
+        # survey missed (benign -- standing down is right, and the log names the
+        # tools so the spelling can be added), or an intermediary that stripped
+        # the search tool and left the marks behind, which upstream will reject.
+        # Headroom's own third-party strip clears both halves precisely so it
+        # cannot be the cause, so seeing this points outside us.
+        _warn_deferred_without_search_tool(tools)
+        return True
     return False
+
+
+_DEFERRED_ORPHAN_WARN_INTERVAL_S = 3600.0
+_deferred_orphan_lock = threading.Lock()
+_deferred_orphan_last: float | None = None
+
+
+def reset_deferred_orphan_warn_state() -> None:
+    """Re-arm the orphaned-deferral warning. For tests."""
+    global _deferred_orphan_last
+    with _deferred_orphan_lock:
+        _deferred_orphan_last = None
+
+
+def _warn_deferred_without_search_tool(tools: Any) -> None:
+    """Warn, at most hourly, that deferred tools have nothing to resolve them."""
+
+    global _deferred_orphan_last
+    now = time.monotonic()
+    with _deferred_orphan_lock:
+        last = _deferred_orphan_last
+        if last is not None and (now - last) < _DEFERRED_ORPHAN_WARN_INTERVAL_S:
+            return
+        _deferred_orphan_last = now
+    names = [
+        str(t.get("name") or t.get("type") or "?")
+        for t in iter_tool_entries(tools)
+        if t.get("defer_loading") is True
+    ]
+    logger.warning(
+        "event=tool_search_deferred_orphan deferred=%d names=%s hint=%s",
+        len(names),
+        ",".join(sorted(names)[:8]),
+        "tools are marked defer_loading but no recognized tool-search tool can "
+        "resolve them; Headroom is standing down. Either this harness spells its "
+        "search tool in a way Headroom does not know (set "
+        "HEADROOM_CLIENT_TOOL_SEARCH_NAMES to teach it) or an intermediary "
+        "stripped the search tool and left the marks, which the upstream will reject",
+    )
 
 
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:

@@ -31,6 +31,7 @@ So: key on the server-side shape, never on the bare client-side name.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -42,6 +43,7 @@ from headroom.proxy.helpers import (
     inject_tool_search_deferral_openai,
     iter_tool_entries,
     request_already_defers_tools,
+    reset_deferred_orphan_warn_state,
     resolved_core_tools,
     strip_first_party_tool_search_tools_for_third_party_upstream,
 )
@@ -652,3 +654,52 @@ def test_the_scan_gate_closes_even_when_the_hint_does_not_fire(
         assert H.tool_search_hint_pending() is False  # ...and the gate closed anyway
     finally:
         H.reset_tool_search_hint_state()
+
+
+# --- orphaned deferrals ----------------------------------------------------
+
+
+def test_deferred_tools_with_no_search_tool_warn(caplog: pytest.LogCaptureFixture) -> None:
+    """Standing down here is right but ambiguous, so it must not be silent.
+
+    Either the harness spells its search tool in a way we do not know, or an
+    intermediary stripped the search tool and left the marks behind. The first
+    is benign and the second is fatal upstream, and only the operator can tell
+    them apart -- so name the tools and say what to do.
+    """
+    reset_deferred_orphan_warn_state()
+    tools = [{"name": "mcp__github__list_issues", "defer_loading": True}, *_mcp(3)]
+
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        assert request_already_defers_tools(tools) is True
+
+    lines = [
+        r.getMessage() for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "mcp__github__list_issues" in lines[0]
+    assert "HEADROOM_CLIENT_TOOL_SEARCH_NAMES" in lines[0]
+
+
+def test_a_recognized_search_tool_is_not_an_orphan(caplog: pytest.LogCaptureFixture) -> None:
+    """The normal deferring client must stay quiet."""
+    reset_deferred_orphan_warn_state()
+    tools = [ANTHROPIC_SEARCH_REGEX, {"name": "mcp__github__x", "defer_loading": True}]
+
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        assert request_already_defers_tools(tools) is True
+
+    assert [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()] == []
+
+
+def test_the_orphan_warning_is_throttled(caplog: pytest.LogCaptureFixture) -> None:
+    """It is evaluated per request; one line per request would be a flood."""
+    reset_deferred_orphan_warn_state()
+    tools = [{"name": "x", "defer_loading": True}]
+
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        for _ in range(50):
+            request_already_defers_tools(tools)
+
+    lines = [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()]
+    assert len(lines) == 1
