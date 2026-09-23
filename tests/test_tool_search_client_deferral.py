@@ -335,3 +335,121 @@ def test_openai_toolsearch_name_alone_does_not_stand_us_down() -> None:
     by_name = {t.get("name"): t for t in out if isinstance(t, dict)}
     assert by_name["ToolSearch"].get("defer_loading") is None
     assert by_name["slack_0"].get("defer_loading") is True
+
+
+# --------------------------------------------------------------------------
+# the resident override must mean the same thing on both paths
+# --------------------------------------------------------------------------
+
+
+def test_openai_keeps_terminal_resident_by_default() -> None:
+    tools = [_fn("terminal"), _fn("bash"), *[_fn(f"slack_{i}") for i in range(14)]]
+
+    by_name = {
+        t.get("name"): t
+        for t in inject_tool_search_deferral_openai(tools, "gpt-5.5")
+        if isinstance(t, dict)
+    }
+
+    assert by_name["terminal"].get("defer_loading") is None
+    assert by_name["bash"].get("defer_loading") is None
+    assert by_name["slack_0"].get("defer_loading") is True
+
+
+def test_openai_override_can_drop_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit core set is authoritative — provider additions included.
+
+    ``terminal`` used to be unioned in unconditionally, so setting the knob to a
+    set without it still pinned it resident. The two provider paths then honoured
+    the same variable differently, and an operator asking to defer a tool was
+    silently refused.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "bash,read")
+    tools = [_fn("terminal"), _fn("bash"), _fn("grep"), *[_fn(f"slack_{i}") for i in range(14)]]
+
+    by_name = {
+        t.get("name"): t
+        for t in inject_tool_search_deferral_openai(tools, "gpt-5.5")
+        if isinstance(t, dict)
+    }
+
+    assert by_name["bash"].get("defer_loading") is None
+    assert by_name["terminal"].get("defer_loading") is True
+    assert by_name["grep"].get("defer_loading") is True
+
+
+def test_default_resident_set_is_unchanged_for_anthropic() -> None:
+    """The OpenAI addition must not leak into the Anthropic default."""
+    assert "terminal" not in resolved_core_tools()
+    assert "terminal" in resolved_core_tools(frozenset({"terminal"}))
+
+
+# --------------------------------------------------------------------------
+# the tool-search-disabled warning must not go quiet forever
+# --------------------------------------------------------------------------
+
+
+def test_hint_rearms_after_the_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One line per process is not proportionate to a permanent condition.
+
+    The warning reports a deployment that has its client's tool deferral turned
+    off — which costs tokens on every request for the life of the deployment.
+    Firing once and never again means a proxy up for weeks says it at startup
+    and is silent through everything after.
+    """
+    from headroom.proxy import helpers as H
+
+    H.reset_tool_search_hint_state()
+    try:
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
+
+        assert H.take_tool_search_hint_slot() is True
+        assert H.take_tool_search_hint_slot() is False
+
+        clock["t"] += H._TOOL_SEARCH_HINT_INTERVAL_S - 1
+        assert H.take_tool_search_hint_slot() is False, "must not re-arm early"
+
+        clock["t"] += 2
+        assert H.take_tool_search_hint_slot() is True, "must re-arm after the interval"
+    finally:
+        H.reset_tool_search_hint_state()
+
+
+# --------------------------------------------------------------------------
+# one knob, two spellings
+# --------------------------------------------------------------------------
+
+
+def test_legacy_env_var_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plugin shipped HEADROOM_TOOL_SEARCH_CORE for the same idea.
+
+    Two variables for one knob means an operator sets the one they know and the
+    other path silently keeps its own list, so the two providers disagree about
+    which tools are visible. Either spelling now works everywhere.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE", "bash,read")
+
+    assert resolved_core_tools() == frozenset({"bash", "read"})
+
+
+def test_canonical_env_var_wins_over_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE", "bash,read")
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "grep")
+
+    assert resolved_core_tools() == frozenset({"grep"})
+
+
+def test_neither_set_keeps_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HEADROOM_TOOL_SEARCH_CORE", raising=False)
+    monkeypatch.delenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", raising=False)
+
+    assert "bash" in resolved_core_tools()
+    assert "read" in resolved_core_tools()
+
+
+def test_empty_override_defers_everything_non_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit empty set is a real instruction, not an unset variable."""
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "")
+
+    assert resolved_core_tools() == frozenset()

@@ -3149,6 +3149,14 @@ _TOOL_SEARCH_BETA_MARKERS = ("advanced-tool-use", "tool-search-tool")
 
 _tool_search_hint_lock = threading.Lock()
 _tool_search_hint_emitted = False
+#: Re-arm interval for the tool-search-disabled warning. It used to fire exactly
+#: once per process, which on a proxy that stays up for weeks means one line in
+#: the log at startup and silence thereafter — the condition it reports persists
+#: for the whole life of the deployment and costs tokens on every single request,
+#: so a single line is not proportionate to it. Hourly is frequent enough that an
+#: operator tailing logs will see it, rare enough that it is not noise.
+_TOOL_SEARCH_HINT_INTERVAL_S = 3600.0
+_tool_search_hint_last: float | None = None
 
 
 def claude_code_tool_search_inactive(
@@ -3202,36 +3210,39 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
 
 
 def tool_search_hint_pending() -> bool:
-    """Cheap, lock-free check of whether the one-time hint may still fire.
+    """Cheap, lock-free check of whether the hint may fire now.
 
     Lets the request hot path skip the (O(number-of-tools)) detection scan on
-    every request once the hint has already been emitted. A benign race here
-    only costs one extra detection scan, never a duplicate warning — the
-    actual one-shot guarantee lives in :func:`take_tool_search_hint_slot`.
+    every request while the hint is throttled. A benign race here only costs one
+    extra detection scan, never a duplicate warning — the rate limit itself
+    lives in :func:`take_tool_search_hint_slot`.
     """
-    return not _tool_search_hint_emitted
+    last = _tool_search_hint_last
+    return last is None or (time.monotonic() - last) >= _TOOL_SEARCH_HINT_INTERVAL_S
 
 
 def take_tool_search_hint_slot() -> bool:
-    """Return ``True`` exactly once per process, gating the one-time hint.
+    """Return ``True`` at most once per ``_TOOL_SEARCH_HINT_INTERVAL_S``.
 
     Thread-safe so concurrent requests cannot each emit the warning.
     """
-    global _tool_search_hint_emitted
-    if _tool_search_hint_emitted:
+    global _tool_search_hint_emitted, _tool_search_hint_last
+    if not tool_search_hint_pending():
         return False
     with _tool_search_hint_lock:
-        if _tool_search_hint_emitted:
+        if not tool_search_hint_pending():
             return False
+        _tool_search_hint_last = time.monotonic()
         _tool_search_hint_emitted = True
         return True
 
 
 def reset_tool_search_hint_state() -> None:
-    """Reset the one-time hint guard. Test helper only."""
-    global _tool_search_hint_emitted
+    """Reset the hint rate limit. Test helper only."""
+    global _tool_search_hint_emitted, _tool_search_hint_last
     with _tool_search_hint_lock:
         _tool_search_hint_emitted = False
+        _tool_search_hint_last = None
 
 
 # ---------------------------------------------------------------------------
@@ -3281,8 +3292,45 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
 )
 
 
-def resolved_core_tools() -> frozenset[str]:
+#: Canonical name for the resident-tool override, and the legacy name the
+#: tool-search plugin shipped for the same idea. Two variables for one knob is a
+#: trap: an operator sets the one they know, the other path silently keeps its
+#: own list, and the two providers disagree about which tools are visible. Both
+#: are read here so either spelling works everywhere; the canonical one wins.
+CORE_TOOLS_ENV = "HEADROOM_TOOL_SEARCH_CORE_TOOLS"
+CORE_TOOLS_ENV_LEGACY = "HEADROOM_TOOL_SEARCH_CORE"
+
+_core_tools_legacy_warned = False
+
+
+def _core_tools_override() -> str | None:
+    """Return the resident-tool override from either env var, canonical first."""
+    global _core_tools_legacy_warned
+    raw = os.environ.get(CORE_TOOLS_ENV)
+    if raw is not None:
+        return raw
+    legacy = os.environ.get(CORE_TOOLS_ENV_LEGACY)
+    if legacy is not None and not _core_tools_legacy_warned:
+        _core_tools_legacy_warned = True
+        logger.warning(
+            "event=tool_search_core_env_legacy old=%s new=%s "
+            "hint=honoring the legacy variable; rename it, both paths read the new one",
+            CORE_TOOLS_ENV_LEGACY,
+            CORE_TOOLS_ENV,
+        )
+    return legacy
+
+
+def resolved_core_tools(extra: frozenset[str] = frozenset()) -> frozenset[str]:
     """Tools that stay resident, with a deployment override.
+
+    ``extra`` carries a provider's own additions to the default resident set
+    (the OpenAI Responses path keeps ``terminal`` resident alongside the shared
+    coding loop). It is folded into the DEFAULT only. An explicit
+    ``HEADROOM_TOOL_SEARCH_CORE_TOOLS`` replaces the whole set, additions
+    included -- otherwise the knob would silently fail to defer a tool the
+    operator had just asked to defer, and the two provider paths would honour
+    the same variable differently.
 
     The default keeps the coding loop resident so routine edit/read/run never
     pays a search round-trip. That default is now out of step with Claude Code,
@@ -3299,9 +3347,9 @@ def resolved_core_tools() -> frozenset[str]:
     against real traffic instead of a guess shipped as a default.
     """
 
-    raw = os.environ.get("HEADROOM_TOOL_SEARCH_CORE_TOOLS")
+    raw = _core_tools_override()
     if raw is None:
-        return _TOOL_SEARCH_CORE_TOOLS
+        return _TOOL_SEARCH_CORE_TOOLS | {_tool_search_resident_key(name) for name in extra}
     return frozenset(_tool_search_resident_key(part) for part in raw.split(",") if part.strip())
 
 
@@ -3933,7 +3981,7 @@ def inject_tool_search_deferral_openai(
     stays valid; the injected search tool is itself resident.
     """
     if core_tools is None:
-        core_tools = resolved_core_tools()
+        core_tools = resolved_core_tools(_OPENAI_TOOL_SEARCH_RESIDENT_NAMES)
     if not openai_tool_search_client_supported(client):
         return tools
     if not _model_supports_openai_tool_search(model):
@@ -3954,9 +4002,11 @@ def inject_tool_search_deferral_openai(
     deferred = 0
     # Normalize for the same reason as the Anthropic path above: clients may use
     # different casing or a leading namespace marker for the same resident tool.
-    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
-        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
-    }
+    # No unconditional union with _OPENAI_TOOL_SEARCH_RESIDENT_NAMES here: it is
+    # folded into the default by resolved_core_tools() above, so an explicit
+    # override drops it too. Unioning it in at this point would pin ``terminal``
+    # resident even when the operator set the core set to something without it.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools}
     for tool in tools:
         if not isinstance(tool, dict):
             out.append(tool)
