@@ -124,6 +124,9 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -177,6 +180,9 @@ def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -215,6 +221,9 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -254,6 +263,9 @@ def _patch_apply_pipeline(monkeypatch, captured: dict[str, object]):
     """Stub out the apply side effects and capture ``build_manifest`` kwargs."""
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -376,6 +388,9 @@ def _apply_capturing_build_manifest(monkeypatch) -> dict[str, object]:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -433,6 +448,8 @@ def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -464,6 +481,8 @@ def test_install_status_survives_non_dict_config(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -490,6 +509,10 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -541,6 +564,10 @@ def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -566,6 +593,10 @@ def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypat
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -589,6 +620,10 @@ def test_install_start_does_not_spawn_when_start_lock_is_contended(monkeypatch) 
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -623,6 +658,10 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -688,6 +727,9 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -739,6 +781,11 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
+
         def __init__(self, profile: str, targets: list[str]) -> None:
             self.profile = profile
             self.preset = "persistent-service"
@@ -825,6 +872,10 @@ def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -845,6 +896,9 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -902,6 +956,9 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -961,6 +1018,9 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -1018,6 +1078,9 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -1070,6 +1133,10 @@ def test_install_remove_continues_when_runtime_teardown_errors(monkeypatch) -> N
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -1107,6 +1174,10 @@ def test_install_agent_ensure_reports_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -1123,6 +1194,10 @@ def test_install_agent_run_exits_with_foreground_status(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -1140,6 +1215,10 @@ def test_install_agent_ensure_no_spawn_when_lock_not_acquired(monkeypatch) -> No
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -1174,6 +1253,10 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1236,6 +1319,10 @@ def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch)
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1279,6 +1366,10 @@ def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch)
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -1317,6 +1408,10 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
