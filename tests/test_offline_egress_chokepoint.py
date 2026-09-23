@@ -36,12 +36,14 @@ drifting apart is the failure mode a Python-only test suite cannot see.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import socket
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -88,6 +90,31 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_OFFLINE", "1")
 
 
+# ``"example.com" in url`` is true of ``https://example.com.attacker.test``
+# and of ``https://host/?next=example.com``. These two helpers parse instead,
+# so a refusal test asserts the host the guard actually named.
+_URL_IN_PROSE = re.compile(r"https?://[^\s,)'\"]+")
+
+
+def _hostnames_in(text: str) -> set[str]:
+    """Every URL host mentioned in a message, compared by parsing."""
+    return {
+        host
+        for url in _URL_IN_PROSE.findall(text)
+        if (host := urlsplit(url.rstrip(".")).hostname) is not None
+    }
+
+
+def _refused_hostname(blocked: OfflineEgressBlocked) -> str | None:
+    """The host the guard refused, taken from the exception, not the prose."""
+    destination = blocked.destination
+    if destination is None:
+        return None
+    if "://" not in destination:
+        return urlsplit(f"//{destination}").hostname
+    return urlsplit(destination).hostname
+
+
 # ─────────────────────────── the guard's own contract ───────────────────────
 
 
@@ -97,10 +124,18 @@ class TestGuardEgress:
             guard_egress("widget sync", "https://widgets.example.com")
         message = str(excinfo.value)
         # The operator has to be able to act on this without reading source:
-        # which switch, which feature, which host.
+        # which switch, which feature, which host. The host is compared by
+        # parsing rather than by substring — `"widgets.example.com" in url` is
+        # true of `https://widgets.example.com.attacker.test` too, so a
+        # substring check here would assert something weaker than the thing
+        # the test is named after (and CodeQL is right to flag it).
+        destination = excinfo.value.destination
+        assert destination is not None
+        assert urlsplit(destination).hostname == "widgets.example.com"
         assert "HEADROOM_OFFLINE" in message
+        assert excinfo.value.purpose == "widget sync"
         assert "widget sync" in message
-        assert "https://widgets.example.com" in message
+        assert f" to {destination}" in message
 
     def test_is_a_no_op_when_online(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
@@ -266,7 +301,7 @@ class TestLangfuseExporterOffline:
         config = LangfuseTracingConfig(enabled=True, public_key="pk", secret_key="sk")
         with pytest.raises(OfflineEgressBlocked) as excinfo:
             configure_langfuse_tracing(config)
-        assert "cloud.langfuse.com" in str(excinfo.value)
+        assert _refused_hostname(excinfo.value) == "cloud.langfuse.com"
 
     def test_disabled_config_is_untouched(self, offline: None, no_sockets: None) -> None:
         from headroom.observability.tracing import (
@@ -397,7 +432,11 @@ class TestRustOfflineParity:
         match = re.search(r"const TRIM_CHARS: \[char; \d+\] = \[(.*?)\];", source, re.DOTALL)
         assert match, "TRIM_CHARS not found in crates/headroom-core/src/offline.rs"
         rust_chars = set()
-        for literal in re.findall(r"'((?:\\u\{[0-9a-fA-F]+\}|\\.|[^'])+)'", match.group(1)):
+        # One Rust char literal is exactly one character: an escape, or a
+        # single non-quote. The `(...)+` this replaces could backtrack
+        # exponentially on a long unterminated run (CodeQL py/redos) and was
+        # matching something the grammar does not even allow.
+        for literal in re.findall(r"'(\\u\{[0-9a-fA-F]{1,6}\}|\\.|[^'\\])'", match.group(1)):
             escape = re.fullmatch(r"\\u\{([0-9a-fA-F]+)\}", literal)
             if escape:
                 rust_chars.add(chr(int(escape.group(1), 16)))
@@ -810,7 +849,10 @@ class TestStartupRefusal:
         assert excinfo.value.code == 78
         message = capsys.readouterr().err
         assert "HEADROOM_KOMPRESS_ENDPOINT" in message
-        assert "kompress.example.com" in message
+        # Exact host, parsed out of the message, for the same reason as in
+        # TestGuardEgress: a substring check would also pass for a URL that
+        # merely contains the host somewhere.
+        assert _hostnames_in(message) == {"kompress.example.com"}
 
     def test_otlp_metrics_contradiction_exits_78(
         self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, capsys
@@ -873,6 +915,391 @@ class TestStartupRefusal:
         )
 
 
+# ───── the nine paths the first cut of this PR blessed instead of guarding ───
+#
+# Each of these was in `_EGRESS_ALLOWLIST` under an `unguarded` reason that
+# said, in effect, "yes, this dials the internet with the air-gap switch on,
+# and that is out of scope". They are the paths an operator most obviously
+# means to stop: an OAuth exchange with github.com, three pollers on a timer,
+# two release downloads, a dataset fetch, and two integrations that put the
+# caller's prompt content on the wire to a Headroom-operated host.
+#
+# Every test here traps the socket rather than only asserting "raises", for the
+# reason given on the `no_sockets` fixture: a guard placed after the client is
+# constructed passes a raises-check and still leaks a connection.
+
+
+class TestCopilotAuthOffline:
+    """GitHub Copilot device-flow auth and token exchange.
+
+    Four call sites, all funnelling through one `_urlopen` helper. Both layers
+    guard: the helper so a fifth call site added later cannot escape, and each
+    entry point so the refusal can name the step the operator was trying to
+    perform instead of just "authentication".
+    """
+
+    def test_device_flow_start_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        from headroom import copilot_auth
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            copilot_auth.start_copilot_device_authorization()
+        assert _refused_hostname(excinfo.value) == "github.com"
+
+    def test_device_flow_poll_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        from headroom import copilot_auth
+
+        with pytest.raises(OfflineEgressBlocked):
+            copilot_auth.poll_copilot_device_authorization("device-code")
+
+    def test_token_exchange_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        from headroom import copilot_auth
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            copilot_auth.CopilotTokenProvider._exchange_token_sync({"Authorization": "token x"})
+        assert "HEADROOM_OFFLINE" in str(excinfo.value)
+
+    def test_user_info_lookup_is_not_swallowed(self, offline: None, no_sockets: None) -> None:
+        """`_fetch_copilot_user_info` wraps its request in `except Exception`
+        and returns None, which is right for "GitHub is down" and wrong for
+        "the operator air-gapped this box": a None here is read as "this token
+        is not a Copilot token" and sends the caller down a different path."""
+        from headroom import copilot_auth
+
+        with pytest.raises(OfflineEgressBlocked):
+            copilot_auth._fetch_copilot_user_info("gho_sometoken")
+
+    def test_the_shared_helper_guards_even_an_unguarded_caller(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        """The backstop, exercised directly: a future fifth call site that
+        forgets its own guard still cannot open a socket."""
+        from urllib import request as urllib_request
+
+        from headroom import copilot_auth
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            copilot_auth._urlopen(urllib_request.Request("https://api.github.com/x"), timeout=1.0)
+        assert _refused_hostname(excinfo.value) == "api.github.com"
+
+
+class TestSubscriptionPollersRefuseLegibly:
+    """The three subscription pollers.
+
+    These run on a timer inside the proxy, so "refuse" cannot mean "raise".
+    An un-caught BaseException out of a background task surfaces as "Task
+    exception was never retrieved" at whatever point the GC gets to it — a
+    traceback with no explanation and no timestamp anyone can correlate. But it
+    also cannot mean "return quietly": a usage panel that silently stops
+    updating is the confusion this switch was meant to end.
+
+    So each one catches the refusal specifically, reports it once at WARNING
+    with the switch named, and returns its ordinary "no data" value.
+    """
+
+    def test_anthropic_poller_returns_none_and_says_why(
+        self, offline: None, no_sockets: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import asyncio
+
+        from headroom.offline import _REPORTED_REFUSALS
+        from headroom.subscription.client import SubscriptionClient
+
+        _REPORTED_REFUSALS.clear()
+        with caplog.at_level("WARNING"):
+            result = asyncio.run(SubscriptionClient().fetch(token="oauth-token"))
+        assert result is None
+        assert "HEADROOM_OFFLINE" in caplog.text
+        assert "subscription" in caplog.text.lower()
+
+    def test_codex_poller_does_not_raise_out_of_its_task(
+        self, offline: None, no_sockets: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import asyncio
+
+        from headroom.offline import _REPORTED_REFUSALS
+        from headroom.subscription import codex_rate_limits
+
+        _REPORTED_REFUSALS.clear()
+        with caplog.at_level("WARNING"):
+            asyncio.run(
+                codex_rate_limits._fetch_and_store_usage(
+                    codex_rate_limits.CODEX_USAGE_URL, {"Authorization": "Bearer x"}
+                )
+            )
+        assert "HEADROOM_OFFLINE" in caplog.text
+
+    def test_codex_poller_is_not_even_scheduled(self, offline: None, no_sockets: None) -> None:
+        """Cheap pre-check: an air-gapped proxy should not spawn a doomed task
+        on every Codex request just to log the same refusal again."""
+        import asyncio
+
+        from headroom.subscription import codex_rate_limits
+
+        async def run() -> bool:
+            return codex_rate_limits.maybe_schedule_usage_poll(
+                {"authorization": "Bearer x", "chatgpt-account-id": "acct"}
+            )
+
+        assert asyncio.run(run()) is False
+
+    def test_copilot_quota_reports_into_its_own_error_slot(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from headroom.offline import _REPORTED_REFUSALS
+        from headroom.subscription.copilot_quota import _CopilotQuotaTracker
+
+        # A token has to be discoverable or the poller returns before it would
+        # ever have dialled, and the test would pass without exercising
+        # anything.
+        monkeypatch.setenv("GITHUB_TOKEN", "gho_test")
+        _REPORTED_REFUSALS.clear()
+        tracker = _CopilotQuotaTracker()
+        asyncio.run(tracker._maybe_poll())
+        assert "HEADROOM_OFFLINE" in (tracker._state.last_error or "")
+
+
+class TestInstallDownloadsOffline:
+    """`headroom install`'s two release downloads.
+
+    `binaries.py` already had `HEADROOM_BINARIES_OFFLINE`, which is exactly the
+    kind of second, differently-named flag an operator should not have to
+    discover after setting an air-gap switch.
+    """
+
+    def test_release_binary_download_opens_no_socket(
+        self, offline: None, no_sockets: None, tmp_path: Path
+    ) -> None:
+        from headroom import binaries
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            binaries._download(
+                "https://github.com/headroomlabs-ai/headroom/releases/download/v1/x",
+                tmp_path / "x",
+                progress=False,
+            )
+        assert _refused_hostname(excinfo.value) == "github.com"
+
+    def test_cbm_download_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        from headroom.graph import installer
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            installer.download_cbm()
+        assert "HEADROOM_OFFLINE" in str(excinfo.value)
+
+    def test_the_binaries_specific_switch_still_wins_first(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Adding the air-gap guard must not change what a user of the narrow
+        flag already sees."""
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        monkeypatch.setenv("HEADROOM_BINARIES_OFFLINE", "1")
+        from headroom import binaries
+
+        with pytest.raises(binaries.OfflineError):
+            binaries._download("https://example.invalid/x", tmp_path / "x", progress=False)
+
+
+class TestEvalDownloadsOffline:
+    def test_bfcl_dataset_download_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        from headroom.evals import datasets
+
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            datasets.load_bfcl(n=1)
+        assert _refused_hostname(excinfo.value) == "huggingface.co"
+
+
+class TestHeadroomCloudCompressionOffline:
+    """Both Headroom Cloud integrations.
+
+    These are the only paths in the tree that ship the caller's prompt content
+    to a Headroom-operated host. "Opt-in by configuration, so an air-gapped
+    deployment would not have configured it" was the old reason for leaving
+    them open, and it inverts the precedence: an operator who sets an air-gap
+    switch is overriding earlier configuration on purpose.
+    """
+
+    def test_asgi_middleware_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        import asyncio
+
+        from headroom.integrations.asgi import CompressionMiddleware
+
+        middleware = CompressionMiddleware(app=None, api_key="hdr_test")
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            asyncio.run(middleware._cloud_compress([{"role": "user", "content": "x"}], "m"))
+        assert _refused_hostname(excinfo.value) == "api.headroomlabs.ai"
+
+    def test_litellm_callback_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        import asyncio
+
+        from headroom.integrations.litellm_callback import HeadroomCallback
+
+        callback = HeadroomCallback(api_key="hdr_test")
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            asyncio.run(callback._cloud_compress([{"role": "user", "content": "x"}], "m"))
+        assert _refused_hostname(excinfo.value) == "api.headroomlabs.ai"
+
+
+class TestCloudEmbeddersOffline:
+    """The OpenAI embedders in the memory layer.
+
+    Embedding a memory means sending its text to api.openai.com. Configured or
+    not, that is Headroom putting the user's data on the wire, which is the
+    distinction the whole policy turns on — unlike the Ollama embedder beside
+    it, whose address comes from the operator and defaults to loopback.
+    """
+
+    def test_openai_embedder_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        pytest.importorskip("openai")
+        from headroom.memory.adapters.embedders import OpenAIEmbedder
+
+        embedder = OpenAIEmbedder(api_key="sk-test")
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            _ = embedder._async_client
+        assert _refused_hostname(excinfo.value) == "api.openai.com"
+
+    def test_direct_mem0_backend_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        import asyncio
+
+        from headroom.memory.backends.direct_mem0 import DirectMem0Adapter
+
+        adapter = DirectMem0Adapter()
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            asyncio.run(adapter._ensure_initialized())
+        assert _refused_hostname(excinfo.value) == "api.openai.com"
+
+    def test_the_ollama_embedder_is_deliberately_untouched(
+        self, offline: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The permitted `operator-endpoint` case, pinned as a behaviour.
+
+        If a later change "tidies up" by guarding every embedder, the on-prem
+        embedding setup an air-gapped deployment is most likely to be running
+        stops working, and this says so before the customer does.
+        """
+        pytest.importorskip("httpx")
+        import asyncio
+
+        from headroom.memory.adapters.embedders import OllamaEmbedder
+
+        embedder = OllamaEmbedder()
+        client = asyncio.run(embedder._get_client())
+        assert str(client.base_url).startswith("http://localhost:11434")
+
+
+class TestFastembedWeightsOffline:
+    """The fastembed relevance model.
+
+    The reason this one stayed open was real: fastembed's constructor has no
+    `local_files_only` flag to hang the guard on, so an unconditional guard
+    would also refuse a warm, pre-seeded cache — which is precisely the setup
+    an air-gapped deployment ships. `_load_text_embedding` makes the split by
+    forcing HF_HUB_OFFLINE for a first, cache-only attempt.
+    """
+
+    @staticmethod
+    def _fake_fastembed(monkeypatch: pytest.MonkeyPatch, *, cached: bool) -> list[str | None]:
+        """Install a stub fastembed whose constructor honours HF_HUB_OFFLINE."""
+        import sys
+
+        seen: list[str | None] = []
+
+        class _TextEmbedding:
+            def __init__(self, **kwargs: object) -> None:
+                seen.append(os.environ.get("HF_HUB_OFFLINE"))
+                if os.environ.get("HF_HUB_OFFLINE") == "1" and not cached:
+                    raise OSError("not cached locally")
+
+        monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=_TextEmbedding))
+        return seen
+
+    def test_a_warm_cache_still_loads_offline(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.relevance import embedding
+
+        seen = self._fake_fastembed(monkeypatch, cached=True)
+        assert embedding._load_text_embedding({"model_name": "m"}) is not None
+        assert seen == ["1"], "the cache-only attempt must force HF_HUB_OFFLINE"
+
+    def test_a_cold_cache_refuses_instead_of_dialling(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.relevance import embedding
+
+        self._fake_fastembed(monkeypatch, cached=False)
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            embedding._load_text_embedding({"model_name": "m"})
+        assert _refused_hostname(excinfo.value) == "huggingface.co"
+
+    def test_the_env_var_is_restored(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+        from headroom.relevance import embedding
+
+        self._fake_fastembed(monkeypatch, cached=True)
+        embedding._load_text_embedding({"model_name": "m"})
+        assert os.environ["HF_HUB_OFFLINE"] == "0"
+
+    def test_the_scorer_reports_a_model_not_an_air_gap_type(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same translation the Kompress and ONNX loaders do: public weights
+        are not data leaving the box, so the caller should hear "this model is
+        unavailable, and here is why" rather than a BaseException it has never
+        seen."""
+        from headroom.relevance.embedding import EmbeddingScorer
+
+        self._fake_fastembed(monkeypatch, cached=False)
+        scorer = EmbeddingScorer(model_name="m")
+        with pytest.raises(RuntimeError) as excinfo:
+            scorer._get_model()
+        assert "unavailable" in str(excinfo.value)
+        assert "HEADROOM_OFFLINE" in str(excinfo.value)
+
+
+class TestCliTranslatesTheRefusal:
+    """The refusal has to arrive as a sentence, not a stack trace.
+
+    `OfflineEgressBlocked` is a BaseException so that no `except Exception`
+    can downgrade it — which also means Click's own error handling, which
+    knows only about ClickException and Abort, would have printed a traceback
+    ending in a type the operator has never heard of. One translation at the
+    outermost boundary fixes that for every subcommand at once.
+    """
+
+    def test_a_refusal_becomes_a_click_error(self, offline: None, no_sockets: None) -> None:
+        import click
+        from click.testing import CliRunner
+
+        from headroom.cli.main import OfflineAwareGroup
+
+        @click.group(cls=OfflineAwareGroup)
+        def cli() -> None:
+            pass
+
+        @cli.command()
+        def dial() -> None:
+            guard_egress("widget sync", "https://widgets.example.com")
+
+        result = CliRunner().invoke(cli, ["dial"])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "HEADROOM_OFFLINE" in result.output
+        assert "widget sync" in result.output
+        assert "Traceback" not in result.output
+
+    def test_the_real_cli_group_uses_it(self) -> None:
+        from headroom.cli.main import OfflineAwareGroup, main
+
+        assert isinstance(main, OfflineAwareGroup), (
+            "headroom.cli.main.main is no longer an OfflineAwareGroup, so an "
+            "air-gap refusal reaches the operator as a traceback again"
+        )
+
+
 # ──────────────────────────────── meta-test ─────────────────────────────────
 #
 # The per-path tests above only cover the paths we already know about. This
@@ -900,9 +1327,19 @@ class _Site:
     guarded: bool
 
 
-# Callee names (as ``ast.unparse`` renders them) that can open a connection.
-# Matched against the whole dotted name, so ``self.client.post`` does not match
-# ``requests.post`` and a local variable named ``urlopen`` does.
+# Callee names, resolved back through the module's imports, that can open a
+# connection. Matched against the whole dotted name, so ``self.client.post``
+# does not match ``requests.post`` and a local variable named ``urlopen`` does.
+#
+# "Resolved back through the imports" is load-bearing and was the scanner's
+# second blind spot. It matched the text ``ast.unparse`` produced, which is
+# whatever local name the module bound — so ``import httpx as h`` followed by
+# ``h.Client()`` was invisible, and so was the real case in
+# ``headroom/copilot_auth.py``: ``from urllib import request as urllib_request``
+# makes every GitHub call render as ``urllib_request.urlopen``, which this
+# pattern never matched. A scanner that can be defeated by a rename is a
+# scanner that reports what people happened to type. :func:`_canonical_callee`
+# rewrites the leading name through the module's own import table first.
 _EGRESS_CALLEES = re.compile(
     r"""^(?:
         httpx\.(?:Async)?Client                        # httpx sync/async client
@@ -1005,13 +1442,61 @@ def _dominates(guard: _Chain, site: _Chain) -> bool:
     return guard_block == site_block and guard_index < site_index
 
 
-def _is_egress_call(call: ast.Call) -> str | None:
+def _import_aliases(module: ast.Module) -> dict[str, str]:
+    """Map every name the module binds by import to its canonical dotted name.
+
+    Collected from the whole tree, not just module level, because half the
+    egress in this package is imported inside the function that uses it
+    (``from openai import AsyncOpenAI`` in a property, ``import httpx`` in a
+    method). Over-reach — an alias bound in one function applied to a name in
+    another — is deliberate: it can only cause the scanner to look at MORE
+    call sites, and a false positive here costs one allowlist entry while a
+    false negative costs an air-gap guarantee.
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                # ``import urllib.request`` binds "urllib"; ``import httpx as h``
+                # binds "h" -> "httpx".
+                bound = name.asname or name.name.split(".")[0]
+                aliases[bound] = name.name if name.asname else bound
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                continue  # relative import: not a third-party egress client
+            for name in node.names:
+                if name.name == "*":
+                    continue
+                aliases[name.asname or name.name] = f"{node.module}.{name.name}"
+    return aliases
+
+
+def _canonical_callee(name: str, aliases: dict[str, str]) -> str:
+    """Rewrite a dotted call target through the module's import table."""
+    head, _, rest = name.partition(".")
+    target = aliases.get(head)
+    if target is None:
+        return name
+    return f"{target}.{rest}" if rest else target
+
+
+def _is_egress_call(call: ast.Call, aliases: dict[str, str]) -> str | None:
     """The matched callee name, or None when this call cannot leave the box."""
     try:
-        name = ast.unparse(call.func)
+        raw = ast.unparse(call.func)
     except Exception:  # pragma: no cover - defensive
         return None
-    if not _EGRESS_CALLEES.match(name):
+    canonical = _canonical_callee(raw, aliases)
+    # The canonical name is the one the patterns are written against. The raw
+    # name is still tried because a few egress classes are only ever named by
+    # their leaf (the OTLP exporters live at a module path far too long and too
+    # version-dependent to pin), and those are imported, so canonicalising
+    # lengthens rather than normalises them.
+    if _EGRESS_CALLEES.match(canonical):
+        name = canonical
+    elif _EGRESS_CALLEES.match(raw):
+        name = raw
+    else:
         return None
     if name.endswith("hf_hub_download"):
         # ``local_files_only=True`` is a pure cache lookup: huggingface_hub
@@ -1032,6 +1517,7 @@ def _is_egress_call(call: ast.Call) -> str | None:
 def _python_egress_sites(source: str) -> list[_Site]:
     """Every egress site in one Python module, each marked guarded or not."""
     module = ast.parse(source)
+    aliases = _import_aliases(module)
     lines = source.splitlines()
     guards: list[_Chain] = []
     candidates: list[tuple[ast.Call, str, _Chain]] = []
@@ -1044,10 +1530,11 @@ def _python_egress_sites(source: str) -> list[_Site]:
                 func_name = ast.unparse(node.func)
             except Exception:  # pragma: no cover - defensive
                 func_name = ""
-            if func_name.split(".")[-1] == "guard_egress":
+            canonical = _canonical_callee(func_name, aliases)
+            if "guard_egress" in (func_name.split(".")[-1], canonical.split(".")[-1]):
                 guards.append(chain)
                 continue
-            callee = _is_egress_call(node)
+            callee = _is_egress_call(node, aliases)
             if callee is not None:
                 candidates.append((node, callee, chain))
 
@@ -1060,17 +1547,35 @@ def _python_egress_sites(source: str) -> list[_Site]:
 
 
 # Every file below has at least one egress site that does NOT call
-# guard_egress, and each needs a reason that survives review. Categories:
+# guard_egress. There are exactly five reasons that can be true and still be
+# correct, and the category prefix has to be one of them:
 #
-#   loopback      talks only to 127.0.0.1 — it never leaves the box, so the
-#                 air-gap switch has nothing to protect.
-#   gated         the caller already checks is_offline() before this code can
-#                 run; routing it through guard_egress would be redundant.
-#   user-traffic  the caller's own request being forwarded, not Headroom
-#                 phoning home. An air-gapped deployment still needs it.
-#   unguarded     genuinely still reachable under HEADROOM_OFFLINE. Recorded
-#                 here on purpose rather than quietly ignored — out of scope
-#                 for A-2, which covers the paths the audit confirmed.
+#   loopback          talks only to 127.0.0.1 / the operator's own local proxy.
+#                     It never leaves the box, so the air-gap switch has
+#                     nothing to protect.
+#   gated             an is_offline() check upstream makes this code
+#                     unreachable, so the connection is never built. Routing it
+#                     through guard_egress as well would be redundant.
+#   user-traffic      the caller's own request being forwarded to the upstream
+#                     the operator configured — the proxy's actual job, and
+#                     the reason an air-gapped deployment runs one at all.
+#   operator-endpoint Headroom dialling an address that comes entirely from
+#                     operator configuration and defaults to loopback. Exactly
+#                     one thing qualifies today (the Ollama embedder). A
+#                     hard-coded internet host may never hide behind this.
+#   cache-only        the call provably cannot reach the network because the
+#                     surrounding code forces the HuggingFace stack offline for
+#                     its duration; the network fallback beside it IS guarded.
+#
+# There is deliberately NO "known violation" category. The first version of
+# this allowlist had one — `unguarded`, "out of scope for A-2" — and it held
+# nine files including Copilot auth, three subscription pollers, the release
+# binary and codebase-memory-mcp downloads, the eval dataset fetch and both
+# Headroom Cloud compression integrations. Recording that a switch does not do
+# what it says is not the same as making it do it, and an allowlist that can
+# absorb a violation stops being a list of exceptions and becomes a list of
+# bugs nobody has to fix. Those nine are now guarded; the category is gone;
+# `test_no_category_permits_a_known_violation` keeps it gone.
 #
 # Value is (number of UNGUARDED egress sites in the file, reason). Guarded
 # sites are not counted and do not need an entry, so a file can legitimately
@@ -1078,6 +1583,12 @@ def _python_egress_sites(source: str) -> list[_Site]:
 # count is part of the assertion: adding a second unguarded client to a listed
 # file trips this test, and so does adding one to a file that is fully guarded
 # today — that file simply has no entry, so the new site is unallowlisted.
+# The complete set of reasons an egress site may skip the guard. Pinned by
+# `test_no_category_permits_a_known_violation`; see the comment above.
+_PERMITTED_CATEGORIES = frozenset(
+    {"loopback", "gated", "user-traffic", "operator-endpoint", "cache-only"}
+)
+
 _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
     "proxy/server.py": (
         2,
@@ -1137,107 +1648,23 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "proxy, not an internet client.",
     ),
     "memory/adapters/embedders.py": (
-        2,
-        "unguarded: two different sites, labelled by the weaker of them. One is "
-        "loopback (OllamaEmbedder against the operator's own base_url, default "
-        "127.0.0.1:11434); the other is OpenAIEmbedder's AsyncOpenAI client, "
-        "which really does reach api.openai.com and is opt-in-cloud by "
-        "configuration — same reasoning as memory/backends/direct_mem0.py, out "
-        "of scope for A-2. (The HF model fetches in this file go through "
-        "onnx_runtime.hf_hub_download_local_first, which now guards.)",
-    ),
-    "copilot_auth.py": (
-        4,
-        "unguarded: GitHub Copilot device-flow auth and token exchange. "
-        "Interactive, user-initiated `headroom auth` egress rather than "
-        "background phone-home, and a Copilot subscription is unusable on an "
-        "air-gapped box regardless. Out of scope for A-2 (which covers the "
-        "paths the audit confirmed); needs its own guard + CLI message.",
-    ),
-    "subscription/client.py": (
         1,
-        "unguarded: Anthropic subscription usage polling. Same reasoning as "
-        "copilot_auth.py — out of scope for A-2, needs its own guard.",
-    ),
-    "subscription/codex_rate_limits.py": (
-        1,
-        "unguarded: Codex rate-limit polling. Out of scope for A-2.",
-    ),
-    "subscription/copilot_quota.py": (
-        1,
-        "unguarded: Copilot quota polling. Out of scope for A-2.",
-    ),
-    "binaries.py": (
-        1,
-        "unguarded: release-binary downloads for `headroom install`. Install "
-        "time, not proxy runtime; already refuses non-https and verifies the "
-        "download. Out of scope for A-2.",
-    ),
-    "graph/installer.py": (
-        1,
-        "unguarded: codebase-memory-mcp release download during install. Same "
-        "reasoning as binaries.py. Out of scope for A-2.",
-    ),
-    "evals/datasets.py": (
-        2,
-        "unguarded: BFCL eval-dataset download. Developer/benchmark tooling, "
-        "never reached by the proxy at runtime. Out of scope for A-2.",
-    ),
-    "evals/batch_compression_eval.py": (
-        2,
-        "unguarded: the Anthropic/OpenAI SDK clients the batch compression "
-        "benchmark drives. Developer tooling run by hand, never imported by "
-        "the proxy. Out of scope for A-2.",
-    ),
-    "evals/memory/judge.py": (
-        4,
-        "unguarded: the OpenAI/Anthropic LLM-judge clients used to score eval "
-        "runs (two ternaries, so four constructor sites). Developer tooling, "
-        "same reasoning as evals/datasets.py. Out of scope for A-2.",
-    ),
-    "evals/html_extraction.py": (
-        4,
-        "unguarded: the OpenAI/Anthropic clients the HTML-extraction eval "
-        "drives. Developer tooling run by hand, never imported by the proxy. "
-        "Out of scope for A-2.",
-    ),
-    "evals/prompt_comparison.py": (
-        1,
-        "unguarded: the OpenAI client the prompt-comparison eval drives. "
-        "Developer tooling, same reasoning as evals/html_extraction.py. Out "
-        "of scope for A-2.",
-    ),
-    "evals/runners/before_after.py": (
-        3,
-        "unguarded: the Anthropic/OpenAI clients the before-after eval runner "
-        "builds. Developer tooling, same reasoning as evals/datasets.py. Out "
-        "of scope for A-2.",
-    ),
-    "memory/backends/direct_mem0.py": (
-        1,
-        "unguarded: the OpenAI embedder the direct mem0 backend builds. An "
-        "opt-in memory backend that is configured with a cloud embedding "
-        "endpoint by definition. Out of scope for A-2.",
-    ),
-    "integrations/asgi.py": (
-        1,
-        "unguarded: Headroom Cloud compression mode, which is opt-in by "
-        "definition (an air-gapped deployment does not configure a cloud API "
-        "URL). Out of scope for A-2.",
-    ),
-    "integrations/litellm_callback.py": (
-        1,
-        "unguarded: Headroom Cloud compression mode. Same reasoning as "
-        "integrations/asgi.py. Out of scope for A-2.",
+        "operator-endpoint: OllamaEmbedder against the base_url the operator "
+        "configured, defaulting to http://localhost:11434. Headroom ships no "
+        "internet host for this path, and refusing it would break the on-prem "
+        "embedding setup an air-gapped deployment is most likely to run. The "
+        "OpenAI embedder in the same file reaches api.openai.com and IS "
+        "guarded; so are the HuggingFace fetches, via "
+        "onnx_runtime.hf_hub_download_local_first.",
     ),
     "relevance/embedding.py": (
-        2,
-        "unguarded: fastembed's TextEmbedding pulls ONNX weights from HF on a "
-        "cache miss. Unlike onnx_runtime.hf_hub_download_local_first there is "
-        "no cache-first/network split to hang the guard on, so guarding it "
-        "would also refuse a warm, pre-seeded cache. Needs that split first; "
-        "out of scope for A-2. The Rust twin (relevance/embedding.rs) IS "
-        "guarded because its caller degrades to BM25 either way.",
+        1,
+        "cache-only: the first of the two fastembed loads in "
+        "_load_text_embedding runs with HF_HUB_OFFLINE forced to 1, so "
+        "huggingface_hub resolves from the local cache or raises without "
+        "opening a socket. The network retry directly below it calls "
+        "guard_egress, which is why a pre-seeded air-gapped host still loads "
+        "the model and a cold one refuses instead of dialling.",
     ),
 }
 
@@ -1279,9 +1706,11 @@ _RESOLUTIONS = (
     "  1. call guard_egress(purpose, destination) BEFORE the client is "
     "constructed, in a position that dominates the call site (same block or "
     "an enclosing one, earlier in that block), or\n"
-    "  2. be added to the allowlist in this file with a written reason "
-    "(loopback / gated / user-traffic / unguarded) and the number of "
-    "UNGUARDED egress sites in the file.\n"
+    "  2. be added to the allowlist in this file with a written reason under "
+    "one of the five permitted categories (loopback / gated / user-traffic / "
+    "operator-endpoint / cache-only) and the number of UNGUARDED egress sites "
+    "in the file. There is no category for 'known violation': if the path can "
+    "dial the internet under HEADROOM_OFFLINE, it is a bug, not an entry.\n"
     "Do not silence this by widening the regex, and do not rely on a guard "
     "somewhere else in the same file — it has to dominate the site."
 )
@@ -1336,12 +1765,47 @@ class TestEgressChokepointCoverage:
         for relpath, (count, reason) in _EGRESS_ALLOWLIST.items():
             assert count > 0, f"{relpath}: egress-site count must be positive"
             assert len(reason) >= 40, f"{relpath}: allowlist reason is too thin to review"
-            assert reason.split(":")[0] in {
-                "loopback",
-                "gated",
-                "user-traffic",
-                "unguarded",
-            }, f"{relpath}: reason must start with a known category, got {reason!r}"
+            assert reason.split(":")[0] in _PERMITTED_CATEGORIES, (
+                f"{relpath}: reason must start with one of the permitted "
+                f"categories {sorted(_PERMITTED_CATEGORIES)}, got {reason!r}"
+            )
+
+    def test_no_category_permits_a_known_violation(self) -> None:
+        """The category list itself is the thing under review here.
+
+        The first version of this allowlist carried an `unguarded` category
+        meaning "yes, this really does dial the internet under
+        HEADROOM_OFFLINE, and we are writing that down instead of fixing it".
+        Nine files sat in it, including GitHub Copilot auth, three subscription
+        pollers, two binary downloads and both Headroom Cloud compression
+        integrations — the Headroom-initiated traffic an operator sets an
+        air-gap switch specifically to stop.
+
+        A table that can absorb a violation turns a policy into a changelog.
+        So the permitted categories are pinned by name: each of the five states
+        a reason the connection is either impossible or is not Headroom phoning
+        home, and adding a sixth that means "we know, and we left it" has to be
+        a deliberate edit to this test with a reviewer looking at it.
+        """
+        assert _PERMITTED_CATEGORIES == {
+            "loopback",
+            "gated",
+            "user-traffic",
+            "operator-endpoint",
+            "cache-only",
+        }, (
+            "the permitted allowlist categories changed. Every one of them has "
+            "to mean 'this connection cannot leave the box' or 'this is not "
+            "Headroom-initiated traffic'. A category that means 'reachable "
+            "under HEADROOM_OFFLINE, out of scope' is what this test exists to "
+            "refuse — guard the path instead."
+        )
+        for relpath, (_count, reason) in _EGRESS_ALLOWLIST.items():
+            assert "out of scope" not in reason.lower(), (
+                f"{relpath}: 'out of scope' is not a reason an operator can "
+                "act on. Guard the path or state which permitted category "
+                "makes the connection legitimate."
+            )
 
     def test_the_guarded_paths_are_actually_seen_as_guarded(self) -> None:
         """The scanner has to recognise the guards this PR added, or "no
@@ -1450,6 +1914,67 @@ class TestSiteScannerRules:
         source = "def f(self):\n    return self.client.post('/x')\n"
         assert _python_egress_sites(source) == []
 
+    def test_an_aliased_module_import_is_not_invisible(self) -> None:
+        """``import httpx as h`` used to defeat the scanner completely.
+
+        It matched the text ``ast.unparse`` produced, which is the local name,
+        so a one-word rename hid an outbound client from a test whose entire
+        job is to notice outbound clients.
+        """
+        source = "import httpx as h\n\ndef f():\n    return h.Client()\n"
+        sites = _python_egress_sites(source)
+        assert [site.callee for site in sites] == ["httpx.Client"]
+
+    def test_an_aliased_from_import_is_not_invisible(self) -> None:
+        """The real instance of the bug, from headroom/copilot_auth.py:
+        ``from urllib import request as urllib_request`` makes every GitHub
+        call in that module render as ``urllib_request.urlopen``, which the
+        pattern never matched — so four Copilot auth call sites and the shared
+        helper underneath them were all invisible."""
+        source = (
+            "from urllib import request as urllib_request\n"
+            "\n"
+            "def f(req):\n"
+            "    return urllib_request.urlopen(req)\n"
+        )
+        sites = _python_egress_sites(source)
+        assert [site.callee for site in sites] == ["urllib.request.urlopen"]
+
+    def test_an_aliased_class_import_is_not_invisible(self) -> None:
+        source = "from openai import AsyncOpenAI as AO\n\ndef f():\n    return AO()\n"
+        sites = _python_egress_sites(source)
+        assert [site.callee for site in sites] == ["openai.AsyncOpenAI"]
+
+    def test_an_alias_bound_inside_a_function_still_resolves(self) -> None:
+        """Half the egress in this package is imported inside the function
+        that uses it, so import collection cannot stop at module level."""
+        source = "def f():\n    import httpx as h\n\n    return h.AsyncClient()\n"
+        sites = _python_egress_sites(source)
+        assert [site.callee for site in sites] == ["httpx.AsyncClient"]
+
+    def test_an_aliased_guard_still_counts_as_a_guard(self) -> None:
+        """The rename defence has to cut both ways, or the fix for the blind
+        spot becomes a new false positive."""
+        source = (
+            "import httpx\n"
+            "from headroom.offline import guard_egress as ge\n"
+            "\n"
+            "def f():\n"
+            "    ge('a', 'b')\n"
+            "    return httpx.Client()\n"
+        )
+        assert [site.guarded for site in _python_egress_sites(source)] == [True]
+
+    def test_canonicalisation_does_not_invent_an_alias(self) -> None:
+        """Only names the module actually bound by import are rewritten.
+
+        Without that constraint the rewrite would be a guess, and a guess that
+        turns arbitrary locals into egress sites makes the allowlist grow for
+        no reason — which is how a tripwire stops being read.
+        """
+        source = "def f(h):\n    return h.Client()\n"
+        assert _python_egress_sites(source) == []
+
     def test_module_level_httpx_verbs_are_sites(self) -> None:
         source = "def f():\n    return httpx.get('https://x')\n"
         assert [site.callee for site in _python_egress_sites(source)] == ["httpx.get"]
@@ -1465,8 +1990,11 @@ _AIR_GAP_DOCS = (
     "headroom/proxy/server.py",
 )
 
-# Phrases that promise a whole-process egress kill switch. Fine to write once
-# the allowlist has no `unguarded` entries left; false until then.
+# Phrases that promise a whole-process egress kill switch with no exceptions.
+# The switch has four stated exceptions (see _EGRESS_ALLOWLIST), all of them
+# either physically incapable of leaving the box or not Headroom-initiated, so
+# these sentences are still wrong — an operator who reads one and skips the
+# firewall rule has been told the wrong thing about forwarded upstream traffic.
 _OVERCLAIMS = (
     "disables all outbound traffic",
     "disables all egress",
@@ -1477,43 +2005,52 @@ _OVERCLAIMS = (
     "all outbound egress disabled",
 )
 
+# What an operator has to be told instead of the sentence above: which traffic
+# survives the switch. Each doc must name the exceptions, not just the switch.
+_REQUIRED_POLICY_TERMS = ("HEADROOM_OFFLINE", "upstream")
+
 
 class TestDocsMatchTheGuarantee:
     """The docs and the allowlist have to agree about what the switch does.
 
     The change that introduced the chokepoint also strengthened
     `docs/metrics-technical-guide.md` to say `HEADROOM_OFFLINE=1` "disables all
-    outbound traffic" — while its own allowlist recorded seven paths as
-    `unguarded`, plus two Rust downloads and the Python HuggingFace fetch. An
-    operator reading that sentence and skipping the firewall rule would have
-    been wrong. This test makes the sentence and the allowlist move together:
-    the strong claim is allowed again the moment the last `unguarded` entry
-    goes away, and not before.
+    outbound traffic" — while its own allowlist recorded nine paths as
+    reachable anyway, plus two Rust downloads and the Python HuggingFace fetch.
+    Those nine are now guarded, but the sentence is *still* wrong, for a
+    smaller and more permanent reason: the proxy goes on forwarding the
+    caller's own requests to the operator's configured upstream, because that
+    is what a proxy is. "All outbound traffic" is not a promise this switch can
+    keep without ceasing to be a proxy.
+
+    So this test has two halves. No doc may make the absolute claim, and every
+    doc must state the exception that replaces it — otherwise the cheap way to
+    pass the first half is to say nothing at all, which leaves the operator
+    exactly as misinformed and with less to read.
     """
 
-    def test_no_doc_claims_more_than_the_allowlist_admits(self) -> None:
-        still_unguarded = sorted(
-            relpath
-            for relpath, (_count, reason) in _EGRESS_ALLOWLIST.items()
-            if reason.startswith("unguarded")
-        )
-        if not still_unguarded:
-            pytest.skip("nothing is recorded as unguarded; the strong claim would be fair")
+    def test_no_doc_makes_the_absolute_claim(self) -> None:
         for relative in _AIR_GAP_DOCS:
             text = (REPO_ROOT / relative).read_text(encoding="utf-8")
             for claim in _OVERCLAIMS:
                 assert claim not in text, (
-                    f"{relative} says {claim!r}, but _EGRESS_ALLOWLIST still "
-                    f"records these as reachable under HEADROOM_OFFLINE: "
-                    f"{still_unguarded}. Guard them or soften the sentence — "
-                    "an operator who believes the sentence skips the firewall rule."
+                    f"{relative} says {claim!r}. HEADROOM_OFFLINE refuses every "
+                    "Headroom-initiated connection, but the proxy still "
+                    "forwards the caller's own requests to the operator's "
+                    "configured upstream — state that exception instead of "
+                    "making a promise the switch cannot keep."
                 )
 
-    def test_the_docs_still_describe_the_switch(self) -> None:
+    def test_every_doc_states_the_exception(self) -> None:
         """The cheap way to pass the test above is to delete the paragraph."""
         for relative in _AIR_GAP_DOCS:
             text = (REPO_ROOT / relative).read_text(encoding="utf-8")
-            assert "HEADROOM_OFFLINE" in text, f"{relative} no longer documents the switch"
+            for term in _REQUIRED_POLICY_TERMS:
+                assert term in text, (
+                    f"{relative} no longer states the {term!r} half of the "
+                    "offline policy. An operator needs both what the switch "
+                    "refuses and what it deliberately still allows."
+                )
 
 
 # ─────────────────────── the Rust half of the same sweep ────────────────────

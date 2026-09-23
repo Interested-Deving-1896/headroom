@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 
 from headroom.models.config import ML_MODEL_DEFAULTS
-from headroom.offline import OFFLINE_ENV, OfflineEgressBlocked
+from headroom.offline import OFFLINE_ENV, OfflineEgressBlocked, guard_egress
 from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 if TYPE_CHECKING:
@@ -668,6 +668,7 @@ class OpenAIEmbedder:
     @cached_property
     def _async_client(self) -> Any:
         """Lazy initialization of async OpenAI client."""
+        guard_egress("OpenAI embedding API", "api.openai.com")
         from openai import AsyncOpenAI
 
         return AsyncOpenAI(api_key=self._api_key)

@@ -1,20 +1,57 @@
 """Air-gap / no-egress master switch (``HEADROOM_OFFLINE``).
 
-A single predicate the individual egress paths consult so a regulated or
-air-gapped deployment can disable **all** outbound network access with one
-flag: the telemetry beacon, the update check, the license/usage reporter, and
-HuggingFace model downloads. Each of those already had its own opt-out; this
-is the one switch that turns them all off together and fails closed.
+THE POLICY, in one sentence: with ``HEADROOM_OFFLINE`` set, Headroom refuses
+every connection **Headroom itself decides to make to a destination Headroom
+itself chose**, and keeps working for the two kinds of traffic an air-gapped
+deployment exists to carry.
 
-:func:`guard_egress` is the chokepoint version of that predicate: a path that
-is about to open an outbound connection calls it and gets a loud
-:class:`OfflineEgressBlocked` instead of a socket. Prefer it over a bare
-``if is_offline(): return`` at any call site that actually dials out — the
-meta-test in ``tests/test_offline_egress_chokepoint.py`` enumerates the
-outbound clients in ``headroom/`` and ``crates/`` and requires each **site** to
-have a guard that dominates it or to be counted in an allowlist with a written
-reason, so the guard is what keeps a newly-added egress path from silently
+Refused (this is not a sample — it is the rule, and the meta-test enforces it):
+the telemetry beacon, the update check, the license/usage reporter, OTLP and
+Langfuse export, HuggingFace/Kompress/fastembed model downloads, release-binary
+and codebase-memory-mcp downloads, eval dataset downloads and the provider SDK
+clients the eval harness drives, GitHub Copilot device-flow auth and token
+exchange, the Anthropic / Codex / Copilot subscription pollers, the OpenAI
+embedders, and both Headroom Cloud compression integrations.
+
+Permitted, explicitly and by name — an air-gapped deployment needs these and
+none of them is Headroom phoning home:
+
+``user-traffic``
+    The proxy forwarding the caller's own request to the upstream the operator
+    configured. Forwarding a request the user's client made, to the endpoint
+    the user pointed Headroom at, is the proxy's entire job. An air-gapped
+    install points it at an on-prem model endpoint.
+``operator-endpoint``
+    Headroom dialling an address that comes **entirely** from operator
+    configuration and whose default is loopback — today that is exactly one
+    thing, the Ollama embedder (``http://localhost:11434``). No hard-coded
+    internet host may hide behind this category.
+``loopback``
+    Hard-coded ``127.0.0.1`` traffic to the operator's own local proxy: the
+    readiness and health probes, ``headroom doctor``, the MCP sidecar.
+``gated``
+    A path that an ``is_offline()`` check upstream already makes unreachable,
+    so the connection is never even built.
+
+Those four are the complete list of exceptions. There is no "known violation"
+category: a path that dials out under ``HEADROOM_OFFLINE`` for any other
+reason is a bug, not an entry in a table.
+
+:func:`guard_egress` is the chokepoint: a path that is about to open an
+outbound connection calls it and gets a loud :class:`OfflineEgressBlocked`
+instead of a socket. Prefer it over a bare ``if is_offline(): return`` at any
+call site that actually dials out — the meta-test in
+``tests/test_offline_egress_chokepoint.py`` enumerates the outbound clients in
+``headroom/`` and ``crates/`` and requires each **site** to have a guard that
+dominates it or to be counted in an allowlist under one of the four categories
+above, so the guard is what keeps a newly-added egress path from silently
 escaping the air-gap.
+
+A refusal must reach a human as a sentence, never as a traceback and never as
+a silent degradation. Interactive paths get that from the CLI boundary in
+``headroom/cli/main.py``, which turns the refusal into a Click error; model
+loaders translate it into their own "model unavailable"; background pollers
+call :func:`note_refusal` and stop.
 
 Kept at the top level (depends only on the stdlib) so any layer — telemetry,
 proxy, model code — can import it without creating a package cycle.
@@ -22,6 +59,7 @@ proxy, model code — can import it without creating a package cycle.
 
 from __future__ import annotations
 
+import logging
 import os
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -147,3 +185,33 @@ def guard_egress(purpose: str, destination: str | None = None) -> None:
     """
     if is_offline():
         raise OfflineEgressBlocked(purpose, destination)
+
+
+# Purposes already reported, so a poller that runs every 30s says it once at
+# WARNING and then keeps quiet. Module-level rather than per-object because
+# several of these pollers are recreated per poll.
+_REPORTED_REFUSALS: set[str] = set()
+
+
+def note_refusal(blocked: OfflineEgressBlocked, log: logging.Logger) -> str:
+    """Report an air-gap refusal on a background path and return its message.
+
+    Background pollers and other fire-and-forget tasks cannot let a
+    ``BaseException`` escape — an unhandled task exception is a traceback in
+    the log, not an explanation, and asyncio may not surface it until the
+    task is garbage collected. They also must not swallow the refusal
+    silently, because "the subscription window stopped updating" with no
+    stated cause is the exact confusion this switch was supposed to end.
+
+    So: catch :class:`OfflineEgressBlocked` specifically, call this, and stop.
+    The first refusal for a given purpose is logged at WARNING with the switch
+    named; later ones drop to DEBUG so a 30-second poller does not flood the
+    log with a decision the operator already made.
+    """
+    message = str(blocked)
+    if blocked.purpose in _REPORTED_REFUSALS:
+        log.debug("%s", message)
+    else:
+        _REPORTED_REFUSALS.add(blocked.purpose)
+        log.warning("%s", message)
+    return message

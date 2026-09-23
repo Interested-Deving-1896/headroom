@@ -2993,22 +2993,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
     # it, force HF/transformers offline before any model code loads, and say
-    # what is covered. The banner deliberately stops short of promising a
-    # whole-process kill switch: some install-time and opt-in-cloud paths are
-    # still unguarded (enumerated in tests/test_offline_egress_chokepoint.py),
-    # and an operator who reads this line as a guarantee may skip the firewall
-    # rule that is still the only hard one. TestDocsMatchTheGuarantee scans
-    # this file for the stronger phrasings and fails while any remain.
+    # what is covered.
+    #
+    # The banner names the exception rather than claiming a whole-process kill
+    # switch, and the exception is permanent rather than a to-do: a proxy that
+    # refused to forward the caller's request to the caller's own upstream
+    # would not be a proxy. Every connection Headroom itself initiates IS
+    # refused; tests/test_offline_egress_chokepoint.py fails the build if a new
+    # egress path appears that is neither guarded nor one of the four written
+    # exceptions. TestDocsMatchTheGuarantee scans this file for the absolute
+    # phrasings and fails while any remain.
     if config.offline:
         os.environ.setdefault("HEADROOM_OFFLINE", "1")
     if is_offline():
         apply_offline_env()
         logger.warning(
-            "event=proxy_offline_mode air-gap active — Headroom-initiated egress is "
-            "blocked (telemetry, update check, license reporter, HuggingFace "
-            "downloads, remote Kompress, OTLP/Langfuse export). Forwarding your "
-            "requests to the configured upstream is unaffected; some install-time "
-            "and opt-in-cloud paths are not covered yet."
+            "event=proxy_offline_mode air-gap active — every connection Headroom "
+            "initiates is refused (telemetry, update check, license reporter, "
+            "model/tokenizer/binary/dataset downloads, remote Kompress, "
+            "OTLP/Langfuse export, Copilot auth, subscription polling, OpenAI "
+            "embedders, Headroom Cloud compression). Still allowed on purpose: "
+            "forwarding your requests to the upstream you configured, "
+            "operator-configured local endpoints, loopback health probes."
         )
 
     proxy = HeadroomProxy(config)
