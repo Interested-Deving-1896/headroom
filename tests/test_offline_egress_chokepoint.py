@@ -1314,6 +1314,63 @@ class TestSiteScannerRules:
         assert [site.callee for site in _python_egress_sites(source)] == ["httpx.get"]
 
 
+# ───────────────── the documented claim vs the actual guarantee ─────────────
+
+_AIR_GAP_DOCS = (
+    "docs/metrics-technical-guide.md",
+    "docs/content/docs/proxy.mdx",
+)
+
+# Phrases that promise a whole-process egress kill switch. Fine to write once
+# the allowlist has no `unguarded` entries left; false until then.
+_OVERCLAIMS = (
+    "disables all outbound traffic",
+    "disables all egress",
+    "blocks all outbound",
+    "hard-disable **all** egress",
+    "hard-disables all egress",
+    "no outbound traffic at all",
+)
+
+
+class TestDocsMatchTheGuarantee:
+    """The docs and the allowlist have to agree about what the switch does.
+
+    The change that introduced the chokepoint also strengthened
+    `docs/metrics-technical-guide.md` to say `HEADROOM_OFFLINE=1` "disables all
+    outbound traffic" — while its own allowlist recorded seven paths as
+    `unguarded`, plus two Rust downloads and the Python HuggingFace fetch. An
+    operator reading that sentence and skipping the firewall rule would have
+    been wrong. This test makes the sentence and the allowlist move together:
+    the strong claim is allowed again the moment the last `unguarded` entry
+    goes away, and not before.
+    """
+
+    def test_no_doc_claims_more_than_the_allowlist_admits(self) -> None:
+        still_unguarded = sorted(
+            relpath
+            for relpath, (_count, reason) in _EGRESS_ALLOWLIST.items()
+            if reason.startswith("unguarded")
+        )
+        if not still_unguarded:
+            pytest.skip("nothing is recorded as unguarded; the strong claim would be fair")
+        for relative in _AIR_GAP_DOCS:
+            text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for claim in _OVERCLAIMS:
+                assert claim not in text, (
+                    f"{relative} says {claim!r}, but _EGRESS_ALLOWLIST still "
+                    f"records these as reachable under HEADROOM_OFFLINE: "
+                    f"{still_unguarded}. Guard them or soften the sentence — "
+                    "an operator who believes the sentence skips the firewall rule."
+                )
+
+    def test_the_docs_still_describe_the_switch(self) -> None:
+        """The cheap way to pass the test above is to delete the paragraph."""
+        for relative in _AIR_GAP_DOCS:
+            text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+            assert "HEADROOM_OFFLINE" in text, f"{relative} no longer documents the switch"
+
+
 # ─────────────────────── the Rust half of the same sweep ────────────────────
 #
 # `crates/` was outside the Python scan entirely, which is how two Rust
