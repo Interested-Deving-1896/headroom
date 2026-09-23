@@ -6,6 +6,15 @@ flag: the telemetry beacon, the update check, the license/usage reporter, and
 HuggingFace model downloads. Each of those already had its own opt-out; this
 is the one switch that turns them all off together and fails closed.
 
+:func:`guard_egress` is the chokepoint version of that predicate: a path that
+is about to open an outbound connection calls it and gets a loud
+:class:`OfflineEgressBlocked` instead of a socket. Prefer it over a bare
+``if is_offline(): return`` at any call site that actually dials out — the
+meta-test in ``tests/test_offline_egress_chokepoint.py`` enumerates the HTTP
+clients in the tree and requires each one to be behind the guard or carry a
+written allowlist reason, so the guard is what keeps a newly-added egress path
+from silently escaping the air-gap.
+
 Kept at the top level (depends only on the stdlib) so any layer — telemetry,
 proxy, model code — can import it without creating a package cycle.
 """
@@ -34,3 +43,60 @@ def apply_offline_env() -> None:
     if is_offline():
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+class OfflineEgressBlocked(RuntimeError):
+    """Raised by :func:`guard_egress` when ``HEADROOM_OFFLINE`` is in force.
+
+    A distinct, named type so callers can tell "the operator air-gapped this
+    box" apart from "the network was flaky". That distinction matters because
+    several Headroom egress paths deliberately fail OPEN on network errors
+    (remote Kompress passes content through verbatim, the license reporter
+    falls back to a cached grant). Fail-open is right for a flaky endpoint and
+    WRONG for a policy refusal: swallowing this exception would turn the
+    air-gap switch back into a suggestion. Anything that catches broad
+    ``Exception`` around an egress call should re-raise this.
+    """
+
+    def __init__(self, purpose: str, destination: str | None = None) -> None:
+        self.purpose = purpose
+        self.destination = destination
+        where = f" to {destination}" if destination else ""
+        super().__init__(
+            f"{OFFLINE_ENV} is set: refusing outbound network access for "
+            f"{purpose}{where}. Unset {OFFLINE_ENV}, or turn off the feature "
+            f"that needs this connection."
+        )
+
+
+def guard_egress(purpose: str, destination: str | None = None) -> None:
+    """The single chokepoint every Headroom-initiated egress path must call.
+
+    Raise :class:`OfflineEgressBlocked` when ``HEADROOM_OFFLINE`` selects
+    offline operation; return silently otherwise.
+
+    Call it BEFORE the socket exists — before constructing the client, not
+    just before the request — so a pooled/keep-alive connection is never even
+    opened. ``purpose`` and ``destination`` land verbatim in the message, so
+    an operator who trips this learns which feature to turn off.
+
+    Why raise instead of returning a no-op result: a silent skip is
+    indistinguishable from success at the call site, so a future refactor can
+    quietly reintroduce egress and nothing fails. A loud, named exception is
+    what makes the meta-test in ``tests/test_offline_egress_chokepoint.py``
+    able to assert "every egress path is behind this or allowlisted".
+
+    Deliberately NOT exempted:
+
+    * Loopback / in-cluster destinations. The guard cannot reliably tell an
+      in-cluster collector from an internet host (DNS, proxies and sidecars
+      all blur it), and ``HEADROOM_OFFLINE`` is documented as "no outbound
+      traffic". Paths that only ever talk to ``127.0.0.1`` — the readiness
+      probes, the proxy's own ``/livez`` check — simply do not call the guard
+      and are allowlisted by name in the meta-test instead.
+    * The proxy's own request forwarding to the caller's configured upstream.
+      That is the caller's traffic, not Headroom phoning home; an air-gapped
+      deployment points it at an on-prem endpoint and still needs it to work.
+    """
+    if is_offline():
+        raise OfflineEgressBlocked(purpose, destination)
