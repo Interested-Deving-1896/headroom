@@ -1012,7 +1012,18 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
+
+    Stateless mode wins over every backend choice. The CLI already exports
+    HEADROOM_CCR_BACKEND=memory, but embedders reach this through
+    ``ProxyConfig(stateless=True)`` without touching the environment, so we
+    fail closed here too: a store that never writes can never leak, and
+    entries stay in-process for the session-scale TTL either way.
     """
+    from ..paths import process_is_stateless
+
+    if process_is_stateless():
+        return None
+
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
     if backend_type == "memory":
         return None

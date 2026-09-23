@@ -38,7 +38,7 @@ LLM PROCESSING
 
 When SmartCrusher compresses tool output:
 
-1. The original content is stored, keyed by hash, with LRU-style eviction once the store hits capacity. In the proxy, this store defaults to a SQLite file (`ccr_store.db` in the workspace directory) rather than a pure in-process dict -- so it survives a proxy restart and is shared across worker processes. Set `HEADROOM_CCR_BACKEND=memory` to opt back into an in-process-only store. Other backend names are resolved via the `headroom.ccr_backend` setuptools entry-point group (e.g. a `redis` backend, if one is installed and registered) -- none besides `sqlite`/`memory` ship in this repo. See `headroom/cache/compression_store.py:1000-1017`.
+1. The original content is stored, keyed by hash, with LRU-style eviction once the store hits capacity. In the proxy, this store defaults to a SQLite file (`ccr_store.db` in the workspace directory) rather than a pure in-process dict -- so it survives a proxy restart and is shared across worker processes. Set `HEADROOM_CCR_BACKEND=memory` to opt back into an in-process-only store; `--stateless` / `HEADROOM_STATELESS` forces that in-process store, so no tool-result original ever reaches `ccr_store.db`. Other backend names are resolved via the `headroom.ccr_backend` setuptools entry-point group (e.g. a `redis` backend, if one is installed and registered) -- none besides `sqlite`/`memory` ship in this repo. See `headroom/cache/compression_store.py:1000-1017`.
 2. A hash key is generated for retrieval
 3. A marker is added to the compressed output:
 

@@ -1286,9 +1286,20 @@ def proxy(
             _paths.codex_wire_debug_dir()
         )
 
-    # Stateless mode: suppress TOIN filesystem persistence
+    # Stateless mode: suppress filesystem persistence for the global stores that
+    # pick their backend from the environment. CCR matters most: its default
+    # SQLite backend writes verbatim tool-result originals to
+    # workspace_dir()/ccr_store.db, which is exactly the content a stateless
+    # deployment is asking us not to put on disk.
+    #
+    # Exporting HEADROOM_STATELESS is what makes `--stateless` and the env var
+    # the same thing everywhere: several writers gate on the env var alone
+    # (TTL observations, the update-check cache), and uvicorn worker processes
+    # only see the mode if it is in the environment they inherit.
     if is_stateless:
+        os.environ["HEADROOM_STATELESS"] = "true"
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+        os.environ["HEADROOM_CCR_BACKEND"] = "memory"
 
     # License key for managed/enterprise deployments (optional)
     license_key = os.environ.get("HEADROOM_LICENSE_KEY")

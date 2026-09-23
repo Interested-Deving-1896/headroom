@@ -1,11 +1,13 @@
 """Tests for the complete stateless write guarantee.
 
 Covers the process-wide stateless flag and the opt-in serving writers gated by
-it: the output-savings recorder and persistent memory. (Savings tracker and
-TOIN are covered in their own test modules.)
+it: the output-savings recorder, persistent memory, and the CCR compression
+store. (Savings tracker and TOIN are covered in their own test modules.)
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -107,3 +109,91 @@ def test_fastembed_custom_model_not_pinned(monkeypatch):
 def test_fastembed_pin_can_be_disabled(monkeypatch):
     monkeypatch.setenv("HEADROOM_HF_PIN", "off")
     assert _pinned_revision(DEFAULT_MODEL_NAME) is None
+
+
+# ---- CCR compression store -------------------------------------------------
+#
+# The CCR store's default backend is a SQLite file in the workspace that holds
+# the *verbatim originals* of compressed tool results. A stateless deployment
+# asking for "no filesystem writes" must not get that file.
+
+
+def test_ccr_backend_is_in_memory_under_stateless(monkeypatch):
+    """process_is_stateless() beats every backend choice, env included."""
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "sqlite")
+    from headroom.cache.compression_store import _create_default_ccr_backend
+
+    paths.set_process_stateless(True)
+    assert _create_default_ccr_backend() is None
+
+
+def test_ccr_backend_is_sqlite_when_not_stateless(monkeypatch, tmp_path):
+    """Control: the persistent default is unchanged outside stateless mode."""
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    from headroom.cache.backends.sqlite import SQLiteBackend
+    from headroom.cache.compression_store import _create_default_ccr_backend
+
+    paths.set_process_stateless(False)
+    assert isinstance(_create_default_ccr_backend(), SQLiteBackend)
+
+
+def test_stateless_proxy_writes_nothing_but_logs_under_home(tmp_path, monkeypatch):
+    """`headroom proxy --stateless` against a fresh HOME leaves only logs behind.
+
+    Runs the real CLI with ``run_server`` swapped for a stand-in that builds the
+    app and pushes a tool-result original through the CCR store — the write the
+    on-disk backend would have made.
+    """
+    pytest.importorskip("click")
+    from click.testing import CliRunner
+
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+    from headroom.cli import proxy as proxy_cli
+    from headroom.proxy import server as proxy_server
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("HEADROOM_WORKSPACE_DIR", raising=False)
+    monkeypatch.delenv("HEADROOM_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+    monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    secret = "BEGIN-SECRET-TOOL-OUTPUT-" + ("x" * 512)
+
+    def _fake_run_server(config, **kwargs):
+        proxy_server.create_app(config)
+        get_compression_store().store(secret, "[compressed]", tool_name="Bash")
+
+    # The CLI imports run_server from headroom.proxy.server inside the command
+    # body, so patch it at the source module.
+    monkeypatch.setattr(proxy_server, "run_server", _fake_run_server)
+
+    reset_compression_store()
+    try:
+        result = CliRunner().invoke(proxy_cli.proxy, ["--stateless", "--port", "18799"])
+        assert result.exit_code == 0, result.output
+        assert os.environ.get("HEADROOM_CCR_BACKEND") == "memory"
+        # The env-only gates (TTL observations, update-check cache) and worker
+        # subprocesses see the mode only if the flag exports it.
+        assert os.environ.get("HEADROOM_STATELESS") == "true"
+    finally:
+        reset_compression_store()
+
+    workspace = home / ".headroom"
+    # Logs are allowed (they are always-on, see _setup_file_logging) and so is
+    # the empty worker-election lock, which lifespan creates and deletes.
+    stray = [
+        p
+        for p in workspace.rglob("*")
+        if p.is_file() and p.parent != workspace / "logs" and not p.name.startswith(".beacon_lock")
+    ]
+    assert stray == [], f"stateless proxy wrote {stray}"
+    # Belt and braces: the content itself is nowhere under HOME.
+    for path in home.rglob("*"):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes(), f"tool-result content leaked to {path}"

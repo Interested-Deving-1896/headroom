@@ -684,6 +684,12 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     makes the backend ``None``, which no-ops load/save/auto-save. The savings
     subsystem is handled separately via ``PrometheusMetrics(stateless=...)``.
 
+    Also covers the CCR compression store, whose default SQLite backend writes
+    verbatim tool-result originals to ``ccr_store.db``. New stores fail closed
+    on their own (see ``_create_default_ccr_backend``); the reset here drops a
+    singleton that an earlier non-stateless caller may already have built on
+    top of the file.
+
     Note: setting ``HEADROOM_TOIN_BACKEND=none`` is NOT sufficient on its own —
     ``ToolIntelligenceNetwork`` falls back to ``config.storage_path`` when no
     backend is passed, so we must clear the path explicitly here.
@@ -700,12 +706,14 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     """
     if not getattr(config, "stateless", False):
         return
+    from headroom.cache.compression_store import reset_compression_store
     from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
 
     # Reset first so this wins regardless of whether the singleton was already
     # created with a filesystem backend earlier in the process.
     reset_toin()
     get_toin(TOINConfig(storage_path=""))
+    reset_compression_store()
 
 
 def _provider_httpx_client_options(
