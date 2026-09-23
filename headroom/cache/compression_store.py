@@ -57,8 +57,10 @@ _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # credentials the redactor does not recognize, customer data. That is not
 # something the always-on runtime log should hold, so previews are OFF unless
 # an operator turns them on with 1/true/yes/on; the log then records byte
-# counts only. Opting in also hardens the log file to 0600 (see
-# ``headroom/proxy/helpers.py:_setup_file_logging``).
+# counts only. (The log file is created owner-only either way — see
+# ``headroom/proxy/helpers.py:_OwnerOnlyRotatingFileHandler`` — because other
+# switches put request content in the same file. That is a second line of
+# defence, not a reason to log the payload.)
 PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
