@@ -13,20 +13,33 @@ was wrong. These tests pin the guarantee down in two complementary ways:
 * **A meta-test.** The per-path tests only cover the paths we already know
   about, and the whole point of a chokepoint is that path number four cannot
   forget it. ``test_every_egress_site_is_guarded_or_allowlisted`` enumerates
-  the outbound HTTP clients in ``headroom/`` and requires each file either to
-  route through ``headroom.offline.guard_egress`` or to carry a written reason
-  in ``_EGRESS_ALLOWLIST``.
+  the outbound clients in ``headroom/`` and requires each **site** either to
+  have a ``guard_egress`` call that dominates it or to be counted in the
+  allowlist with a written reason. Per site, not per file: a file-wide
+  "contains the string guard_egress" check — the first version of this test —
+  exempts a module because of a word in its docstring, and makes the
+  allowlist's site counts unreachable for every file that guards anything.
+  ``TestSiteScannerRules`` pins each of those bypasses.
 
-The Rust half of the switch (``crates/headroom-core/src/offline.rs``) is
-runtime-tested by ``cargo test -p headroom-core``; what lives here is the
-cross-language parity assertion, because the two implementations silently
+* **The same sweep over ``crates/``.** ``TestRustEgressChokepointCoverage``
+  applies a text-level version of the rule to the Rust sources. ``crates/``
+  was outside the Python scan entirely, which is how the Kompress model and
+  fastembed weight downloads stayed open in the same change that guarded the
+  Rust tokenizer fetch for precisely the reason that applied to all three.
+
+The runtime behaviour of the Rust switch (``crates/headroom-core/src/
+offline.rs``) is tested by ``cargo test -p headroom-core``; what lives here is
+the cross-language parity assertion, because the two implementations silently
 drifting apart is the failure mode a Python-only test suite cannot see.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import socket
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -208,6 +221,109 @@ class TestOtlpExporterOffline:
                 metrics_mod._global_metrics = previous
 
 
+# ───────────── path 2b: the Langfuse OTLP trace exporter ────────────────────
+
+
+class TestLangfuseExporterOffline:
+    """The metric exporter's twin, missed when the metric one was guarded.
+
+    Same shape — an OTLP/HTTP exporter plus a background batch timer — but
+    pointed at ``cloud.langfuse.com`` by default rather than at whatever the
+    operator configured, so if anything it is the more clear-cut egress of the
+    two.
+    """
+
+    def test_configure_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        from headroom.observability.tracing import (
+            LangfuseTracingConfig,
+            configure_langfuse_tracing,
+        )
+
+        config = LangfuseTracingConfig(enabled=True, public_key="pk", secret_key="sk")
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            configure_langfuse_tracing(config)
+        assert "cloud.langfuse.com" in str(excinfo.value)
+
+    def test_disabled_config_is_untouched(self, offline: None, no_sockets: None) -> None:
+        from headroom.observability.tracing import (
+            LangfuseTracingConfig,
+            configure_langfuse_tracing,
+        )
+
+        assert configure_langfuse_tracing(LangfuseTracingConfig(enabled=False)) is not None
+
+
+# ────────── path 4: the Python half of the HuggingFace download ─────────────
+
+
+class TestHuggingFaceDownloadOffline:
+    """``onnx_runtime.hf_hub_download_local_first`` is the Python twin of the
+    Rust Hub fetch this PR guarded, and it was left open — every ONNX model in
+    the tree (Kompress, the image router, the memory embedders) resolves
+    through it.
+
+    Both halves of the contract are pinned here, because the interesting part
+    is what is NOT refused: the guard sits on the network fallback only, so a
+    pre-seeded air-gapped cache keeps working. A guard at the top of the
+    function would pass a "raises" test and break every air-gapped deployment
+    that did the thing we tell operators to do.
+    """
+
+    @staticmethod
+    def _fake_hub(monkeypatch: pytest.MonkeyPatch, *, cached: str | None) -> list[bool]:
+        import huggingface_hub
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        seen: list[bool] = []
+
+        def fake_download(
+            repo_id: str,
+            filename: str,
+            *,
+            revision: str | None = None,
+            local_files_only: bool = False,
+        ) -> str:
+            seen.append(local_files_only)
+            if local_files_only and cached is None:
+                raise LocalEntryNotFoundError("cold cache")
+            return cached or "/downloaded/from/the/hub"
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+        return seen
+
+    def test_a_cold_cache_is_refused(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.onnx_runtime import hf_hub_download_local_first
+
+        seen = self._fake_hub(monkeypatch, cached=None)
+        with pytest.raises(OfflineEgressBlocked):
+            hf_hub_download_local_first("acme/model", "model.onnx")
+        # The cache lookup ran; the network download never did.
+        assert seen == [True]
+
+    def test_a_warm_cache_still_resolves_offline(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.onnx_runtime import hf_hub_download_local_first
+
+        self._fake_hub(monkeypatch, cached="/cache/acme/model.onnx")
+        assert hf_hub_download_local_first("acme/model", "model.onnx") == "/cache/acme/model.onnx"
+
+    def test_allow_network_false_still_raises_the_cache_error(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``allow_network=False`` never reaches the guard, so the caller keeps
+        seeing the local-lookup error it already handles."""
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        from headroom.onnx_runtime import hf_hub_download_local_first
+
+        self._fake_hub(monkeypatch, cached=None)
+        with pytest.raises(LocalEntryNotFoundError):
+            hf_hub_download_local_first("acme/model", "model.onnx", allow_network=False)
+
+
 # ───────────────── path 3: the Rust HuggingFace fetch (parity) ──────────────
 
 _RUST_OFFLINE = REPO_ROOT / "crates" / "headroom-core" / "src" / "offline.rs"
@@ -256,27 +372,193 @@ class TestRustOfflineParity:
 
 
 # ──────────────────────────────── meta-test ─────────────────────────────────
+#
+# The per-path tests above only cover the paths we already know about. This
+# half is the standing guarantee: a NEW egress path cannot land without either
+# calling the guard or being written into the allowlist with a reason.
+#
+# It decides per **egress site**, not per file. The first cut of this test
+# skipped any file whose text contained "guard_egress" anywhere — including in
+# a docstring — which made every allowlist count unreachable for guarded files
+# and let a second, unguarded client slip into an already-guarded module. The
+# scan is therefore built on the AST (so comments and docstrings cannot vouch
+# for anything) and a site counts as guarded only when a guard_egress call
+# DOMINATES it: same block or an enclosing block, textually earlier, in the
+# same function. A guard in a sibling branch, in a nested function, or in an
+# except: arm the site does not sit in is not a guard for that site.
 
-# Anything that can open an outbound connection. Kept deliberately broad and
-# textual: a regex over the tree catches a new egress path in review even when
-# it lands in a module nobody thought to wire into the guard, which an
-# import-graph check would not.
-_EGRESS_PATTERNS = re.compile(
-    r"""
-      httpx\.(?:Async)?Client\(       # httpx sync/async client
-    | (?<![\w.])requests\.(?:get|post|put|patch|delete|head|request|Session)\(
-    | urlopen\(                       # urllib.request.urlopen, bare, or a
-                                      # module-local `_urlopen` wrapper — the
-                                      # `def` line itself is skipped by the
-                                      # scanner, so only call sites count
-    | aiohttp\.ClientSession\(
-    | (?<![\w.])urllib3\.PoolManager\(
-    """,
+
+@dataclass(frozen=True)
+class _Site:
+    """One place that can open an outbound connection."""
+
+    line: int
+    text: str
+    callee: str
+    guarded: bool
+
+
+# Callee names (as ``ast.unparse`` renders them) that can open a connection.
+# Matched against the whole dotted name, so ``self.client.post`` does not match
+# ``requests.post`` and a local variable named ``urlopen`` does.
+_EGRESS_CALLEES = re.compile(
+    r"""^(?:
+        httpx\.(?:Async)?Client                        # httpx sync/async client
+      | httpx\.(?:get|post|put|patch|delete|head|request|stream)  # module-level verbs
+      | requests\.(?:get|post|put|patch|delete|head|request|Session)
+      | (?:urllib\.request\.)?urlopen | _urlopen       # urllib, bare or wrapped
+      | aiohttp\.ClientSession
+      | urllib3\.PoolManager
+      | (?:huggingface_hub\.)?hf_hub_download          # the Python half of the HF fetch
+      | (?:fastembed\.)?TextEmbedding                  # fastembed pulls ONNX weights from HF
+      | OTLP(?:Metric|Span|Log)Exporter                # OTEL export, incl. its background timer
+      | (?:openai\.)?(?:Async)?(?:OpenAI|AzureOpenAI)  # provider SDKs build their own
+      | (?:anthropic\.)?(?:Async)?Anthropic(?:Bedrock|Vertex)?
+    )$""",
     re.VERBOSE,
 )
 
-# Every file below opens an outbound connection WITHOUT calling guard_egress,
-# and each needs a reason that survives review. Categories used:
+# Statement fields that hold a nested block. ``handlers``/``cases`` hold nodes
+# that own a block rather than a block, so they are unwrapped separately.
+_BLOCK_OWNERS: tuple[type, ...] = (ast.excepthandler,) + (
+    (ast.match_case,) if hasattr(ast, "match_case") else ()
+)
+
+# A position in the statement tree: one (block identity, index) pair per level
+# of nesting. Comparing two of these is how dominance is decided.
+_Chain = tuple[tuple[int, int], ...]
+
+
+def _child_blocks(node: ast.AST) -> Iterator[list[ast.stmt]]:
+    """Yield the statement lists nested directly inside ``node``."""
+    for _field, value in ast.iter_fields(node):
+        if not isinstance(value, list) or not value:
+            continue
+        if isinstance(value[0], ast.stmt):
+            yield value  # type: ignore[misc]
+        else:
+            for item in value:
+                if isinstance(item, _BLOCK_OWNERS):
+                    yield from _child_blocks(item)
+
+
+def _statement_chains(module: ast.Module) -> list[tuple[ast.stmt, _Chain]]:
+    """Every statement in the module, paired with its position chain."""
+    out: list[tuple[ast.stmt, _Chain]] = []
+
+    def walk(block: list[ast.stmt], prefix: _Chain) -> None:
+        for index, statement in enumerate(block):
+            chain: _Chain = (*prefix, (id(block), index))
+            out.append((statement, chain))
+            for nested in _child_blocks(statement):
+                walk(nested, chain)
+
+    walk(module.body, ())
+    return out
+
+
+def _own_expressions(statement: ast.stmt) -> Iterator[ast.AST]:
+    """Expression nodes belonging to ``statement`` itself, not to its block.
+
+    Descending into nested statements here would attribute an inner call to
+    the outer compound statement and give it the wrong position, which is what
+    dominance is computed from.
+    """
+    stack: list[ast.AST] = []
+    for _field, value in ast.iter_fields(statement):
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, ast.AST) and not isinstance(item, (ast.stmt, *_BLOCK_OWNERS)):
+                stack.append(item)
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, (ast.stmt, *_BLOCK_OWNERS)):
+                stack.append(child)
+
+
+def _dominates(guard: _Chain, site: _Chain) -> bool:
+    """True when a guard at ``guard`` always runs before a site at ``site``.
+
+    The guard's own block must be the site's block or an ancestor of it, and
+    the guard must come earlier in that block. That rejects, on purpose:
+
+    * a guard inside an ``if``/``except``/nested ``def`` the site is not in —
+      the guard's block is not on the site's ancestor chain;
+    * a guard that appears later in the same block;
+    * a guard anywhere in the file that simply shares a module with the site,
+      which is all the first version of this test ever checked.
+
+    It also (conservatively) rejects a guard that lives in a helper the site's
+    function calls. That is the intended trade: the guard is cheap, and
+    "somebody up the stack probably guards this" is how egress paths get lost.
+    """
+    if len(guard) > len(site):
+        return False
+    depth = len(guard) - 1
+    if guard[:depth] != site[:depth]:
+        return False
+    guard_block, guard_index = guard[depth]
+    site_block, site_index = site[depth]
+    return guard_block == site_block and guard_index < site_index
+
+
+def _is_egress_call(call: ast.Call) -> str | None:
+    """The matched callee name, or None when this call cannot leave the box."""
+    try:
+        name = ast.unparse(call.func)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if not _EGRESS_CALLEES.match(name):
+        return None
+    if name.endswith("hf_hub_download"):
+        # ``local_files_only=True`` is a pure cache lookup: huggingface_hub
+        # raises rather than dialling, so it opens no socket and needs no
+        # guard. Counting it would force a guard onto the cache-hit path and
+        # break exactly the pre-seeded air-gapped deployment we want to keep
+        # working. (The network fallback beside it still counts.)
+        for keyword in call.keywords:
+            if (
+                keyword.arg == "local_files_only"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+            ):
+                return None
+    return name
+
+
+def _python_egress_sites(source: str) -> list[_Site]:
+    """Every egress site in one Python module, each marked guarded or not."""
+    module = ast.parse(source)
+    lines = source.splitlines()
+    guards: list[_Chain] = []
+    candidates: list[tuple[ast.Call, str, _Chain]] = []
+
+    for statement, chain in _statement_chains(module):
+        for node in _own_expressions(statement):
+            if not isinstance(node, ast.Call):
+                continue
+            try:
+                func_name = ast.unparse(node.func)
+            except Exception:  # pragma: no cover - defensive
+                func_name = ""
+            if func_name.split(".")[-1] == "guard_egress":
+                guards.append(chain)
+                continue
+            callee = _is_egress_call(node)
+            if callee is not None:
+                candidates.append((node, callee, chain))
+
+    sites: list[_Site] = []
+    for node, callee, chain in candidates:
+        guarded = any(_dominates(guard, chain) for guard in guards)
+        text = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+        sites.append(_Site(line=node.lineno, text=text, callee=callee, guarded=guarded))
+    return sorted(sites, key=lambda site: site.line)
+
+
+# Every file below has at least one egress site that does NOT call
+# guard_egress, and each needs a reason that survives review. Categories:
 #
 #   loopback      talks only to 127.0.0.1 — it never leaves the box, so the
 #                 air-gap switch has nothing to protect.
@@ -286,12 +568,14 @@ _EGRESS_PATTERNS = re.compile(
 #                 phoning home. An air-gapped deployment still needs it.
 #   unguarded     genuinely still reachable under HEADROOM_OFFLINE. Recorded
 #                 here on purpose rather than quietly ignored — out of scope
-#                 for A-2, which covers the three paths the audit confirmed.
+#                 for A-2, which covers the paths the audit confirmed.
 #
-# Value is (number of egress sites in the file, reason). The count is part of
-# the assertion so that ADDING a second client to an already-listed file trips
-# this test too — otherwise the allowlist becomes a blanket exemption for the
-# whole file forever.
+# Value is (number of UNGUARDED egress sites in the file, reason). Guarded
+# sites are not counted and do not need an entry, so a file can legitimately
+# appear here and still route some of its egress through the chokepoint. The
+# count is part of the assertion: adding a second unguarded client to a listed
+# file trips this test, and so does adding one to a file that is fully guarded
+# today — that file simply has no entry, so the new site is unallowlisted.
 _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
     "proxy/server.py": (
         2,
@@ -330,6 +614,11 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         1,
         "loopback: hard-coded http://127.0.0.1:<port>/admin/runtime-env on the local proxy.",
     ),
+    "cli/mcp.py": (
+        1,
+        "loopback: `headroom mcp status` probing <proxy_url>/health, which is "
+        "the operator's own local proxy (defaults to 127.0.0.1:8787).",
+    ),
     "providers/copilot/wrap.py": (
         1,
         "loopback: hard-coded http://127.0.0.1:<port>/health on the local proxy.",
@@ -346,17 +635,21 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "proxy, not an internet client.",
     ),
     "memory/adapters/embedders.py": (
-        1,
-        "loopback: OllamaEmbedder against the operator's own Ollama base_url, "
-        "which defaults to 127.0.0.1:11434.",
+        2,
+        "loopback: OllamaEmbedder against the operator's own Ollama base_url "
+        "(defaults to 127.0.0.1:11434). The second site is OpenAIEmbedder's "
+        "AsyncOpenAI client, which is unguarded and opt-in-cloud by "
+        "configuration — same reasoning as memory/backends/direct_mem0.py, "
+        "out of scope for A-2. (The HF model fetches in this file go through "
+        "onnx_runtime.hf_hub_download_local_first, which now guards.)",
     ),
     "copilot_auth.py": (
-        6,
+        4,
         "unguarded: GitHub Copilot device-flow auth and token exchange. "
         "Interactive, user-initiated `headroom auth` egress rather than "
         "background phone-home, and a Copilot subscription is unusable on an "
         "air-gapped box regardless. Out of scope for A-2 (which covers the "
-        "three paths the audit confirmed); needs its own guard + CLI message.",
+        "paths the audit confirmed); needs its own guard + CLI message.",
     ),
     "subscription/client.py": (
         1,
@@ -387,6 +680,42 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "unguarded: BFCL eval-dataset download. Developer/benchmark tooling, "
         "never reached by the proxy at runtime. Out of scope for A-2.",
     ),
+    "evals/batch_compression_eval.py": (
+        2,
+        "unguarded: the Anthropic/OpenAI SDK clients the batch compression "
+        "benchmark drives. Developer tooling run by hand, never imported by "
+        "the proxy. Out of scope for A-2.",
+    ),
+    "evals/memory/judge.py": (
+        4,
+        "unguarded: the OpenAI/Anthropic LLM-judge clients used to score eval "
+        "runs (two ternaries, so four constructor sites). Developer tooling, "
+        "same reasoning as evals/datasets.py. Out of scope for A-2.",
+    ),
+    "evals/html_extraction.py": (
+        4,
+        "unguarded: the OpenAI/Anthropic clients the HTML-extraction eval "
+        "drives. Developer tooling run by hand, never imported by the proxy. "
+        "Out of scope for A-2.",
+    ),
+    "evals/prompt_comparison.py": (
+        1,
+        "unguarded: the OpenAI client the prompt-comparison eval drives. "
+        "Developer tooling, same reasoning as evals/html_extraction.py. Out "
+        "of scope for A-2.",
+    ),
+    "evals/runners/before_after.py": (
+        3,
+        "unguarded: the Anthropic/OpenAI clients the before-after eval runner "
+        "builds. Developer tooling, same reasoning as evals/datasets.py. Out "
+        "of scope for A-2.",
+    ),
+    "memory/backends/direct_mem0.py": (
+        1,
+        "unguarded: the OpenAI embedder the direct mem0 backend builds. An "
+        "opt-in memory backend that is configured with a cloud embedding "
+        "endpoint by definition. Out of scope for A-2.",
+    ),
     "integrations/asgi.py": (
         1,
         "unguarded: Headroom Cloud compression mode, which is opt-in by "
@@ -398,33 +727,65 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "unguarded: Headroom Cloud compression mode. Same reasoning as "
         "integrations/asgi.py. Out of scope for A-2.",
     ),
+    "relevance/embedding.py": (
+        2,
+        "unguarded: fastembed's TextEmbedding pulls ONNX weights from HF on a "
+        "cache miss. Unlike onnx_runtime.hf_hub_download_local_first there is "
+        "no cache-first/network split to hang the guard on, so guarding it "
+        "would also refuse a warm, pre-seeded cache. Needs that split first; "
+        "out of scope for A-2. The Rust twin (relevance/embedding.rs) IS "
+        "guarded because its caller degrades to BM25 either way.",
+    ),
 }
 
 
-def _egress_sites() -> dict[str, list[tuple[int, str]]]:
-    """Map ``headroom/``-relative path -> [(line number, source line)]."""
-    found: dict[str, list[tuple[int, str]]] = {}
+def _python_sites_by_file() -> dict[str, list[_Site]]:
+    """Map ``headroom/``-relative path -> egress sites, guarded or not."""
+    found: dict[str, list[_Site]] = {}
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            source = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:  # pragma: no cover - defensive
             continue
-        hits = []
-        for number, line in enumerate(lines, start=1):
-            stripped = line.strip()
-            # A `def _urlopen(...)` wrapper is a definition, not a call; the
-            # call sites through it are counted separately.
-            if stripped.startswith(("def ", "async def ")):
-                continue
-            if _EGRESS_PATTERNS.search(line):
-                hits.append((number, stripped))
-        if hits:
-            found[path.relative_to(PACKAGE_ROOT).as_posix()] = hits
+        try:
+            sites = _python_egress_sites(source)
+        except SyntaxError:  # pragma: no cover - defensive
+            continue
+        if sites:
+            found[path.relative_to(PACKAGE_ROOT).as_posix()] = sites
     return found
 
 
+def _unguarded_by_file() -> dict[str, list[_Site]]:
+    out = {}
+    for relpath, sites in _python_sites_by_file().items():
+        unguarded = [site for site in sites if not site.guarded]
+        if unguarded:
+            out[relpath] = unguarded
+    return out
+
+
+def _render(relpath: str, sites: list[_Site], *, root: str = "headroom") -> str:
+    shown = "\n".join(f"        line {site.line}: {site.text}" for site in sites)
+    return f"  {root}/{relpath}\n{shown}"
+
+
+_RESOLUTIONS = (
+    "\n\nHEADROOM_OFFLINE=1 is documented as an air-gap switch, so every path "
+    "that opens a connection must either:\n"
+    "  1. call guard_egress(purpose, destination) BEFORE the client is "
+    "constructed, in a position that dominates the call site (same block or "
+    "an enclosing one, earlier in that block), or\n"
+    "  2. be added to the allowlist in this file with a written reason "
+    "(loopback / gated / user-traffic / unguarded) and the number of "
+    "UNGUARDED egress sites in the file.\n"
+    "Do not silence this by widening the regex, and do not rely on a guard "
+    "somewhere else in the same file — it has to dominate the site."
+)
+
+
 class TestEgressChokepointCoverage:
-    """Fails when someone adds an outbound HTTP client that nothing checked.
+    """Fails when someone adds an outbound client that nothing checked.
 
     The failure message names the file and the exact lines, and tells the
     author the two acceptable resolutions, so the test is a code-review aid
@@ -433,44 +794,37 @@ class TestEgressChokepointCoverage:
 
     def test_every_egress_site_is_guarded_or_allowlisted(self) -> None:
         problems: list[str] = []
-        for relpath, hits in _egress_sites().items():
-            source = (PACKAGE_ROOT / relpath).read_text(encoding="utf-8")
-            if "guard_egress" in source:
-                continue
+        unguarded = _unguarded_by_file()
+        for relpath, sites in unguarded.items():
             entry = _EGRESS_ALLOWLIST.get(relpath)
             if entry is None:
-                shown = "\n".join(f"        line {n}: {text}" for n, text in hits)
-                problems.append(f"  headroom/{relpath} — not guarded, not allowlisted\n{shown}")
+                problems.append(
+                    _render(relpath, sites) + "\n        (not guarded, not allowlisted)"
+                )
                 continue
             expected, _reason = entry
-            if len(hits) != expected:
-                shown = "\n".join(f"        line {n}: {text}" for n, text in hits)
+            if len(sites) != expected:
                 problems.append(
-                    f"  headroom/{relpath} — allowlist records {expected} egress "
-                    f"site(s), found {len(hits)}\n{shown}"
+                    _render(relpath, sites)
+                    + f"\n        (allowlist records {expected} unguarded egress "
+                    f"site(s), found {len(sites)})"
                 )
 
         assert not problems, (
-            "New or changed outbound HTTP egress found in headroom/.\n\n"
+            "New or changed outbound egress found in headroom/.\n\n"
             + "\n".join(problems)
-            + "\n\nHEADROOM_OFFLINE=1 is documented as an air-gap switch, so "
-            "every path that opens a connection must either:\n"
-            "  1. call headroom.offline.guard_egress(purpose, destination) "
-            "BEFORE the client is constructed, or\n"
-            "  2. be added to _EGRESS_ALLOWLIST in this file with a written "
-            "reason (loopback / gated / user-traffic / unguarded) and the "
-            "number of egress sites in the file.\n"
-            "Do not silence this by widening the regex."
+            + _RESOLUTIONS
         )
 
     def test_allowlist_has_no_stale_entries(self) -> None:
         """A stale entry is worse than a missing one: it reads as a reviewed
         decision about code that no longer exists, and it hides the next real
         addition to that file behind a count that was never re-checked."""
-        sites = _egress_sites()
-        stale = sorted(set(_EGRESS_ALLOWLIST) - set(sites))
+        unguarded = _unguarded_by_file()
+        stale = sorted(set(_EGRESS_ALLOWLIST) - set(unguarded))
         assert not stale, (
-            f"_EGRESS_ALLOWLIST entries no longer have any egress site; delete them: {stale}"
+            "allowlist entries no longer have any UNGUARDED egress site; "
+            f"delete them (or they were just fixed — delete them anyway): {stale}"
         )
 
     def test_allowlist_reasons_are_written_out(self) -> None:
@@ -485,3 +839,262 @@ class TestEgressChokepointCoverage:
                 "user-traffic",
                 "unguarded",
             }, f"{relpath}: reason must start with a known category, got {reason!r}"
+
+    def test_the_guarded_paths_are_actually_seen_as_guarded(self) -> None:
+        """The scanner has to recognise the guards this PR added, or "no
+        unguarded sites" would be a vacuous pass for those files."""
+        sites = _python_sites_by_file()
+        for relpath in (
+            "transforms/kompress_remote.py",
+            "observability/metrics.py",
+            "onnx_runtime.py",
+        ):
+            assert relpath in sites, f"{relpath} has no detected egress site at all"
+            assert any(site.guarded for site in sites[relpath]), (
+                f"{relpath} routes through guard_egress but the scanner does not "
+                "see any site as guarded — the dominance check has drifted"
+            )
+
+
+# ───────────────── the meta-test's own dominance rules ──────────────────────
+
+
+class TestSiteScannerRules:
+    """Tests for the scanner itself.
+
+    The defect this replaces was not a missing rule, it was a rule that never
+    ran: a file-wide ``"guard_egress" in source`` check meant the word in a
+    docstring exempted the whole module. A meta-test nobody tests is just a
+    comment, so each bypass that was demonstrated against the old version is
+    pinned here.
+    """
+
+    def test_a_guard_in_a_docstring_guards_nothing(self) -> None:
+        source = '"""This module would call guard_egress if it were real."""\nimport httpx\nc = httpx.Client()\n'
+        sites = _python_egress_sites(source)
+        assert [site.guarded for site in sites] == [False]
+
+    def test_a_second_client_in_a_guarded_file_is_unguarded(self) -> None:
+        source = (
+            "def one():\n"
+            "    guard_egress('a', 'b')\n"
+            "    return httpx.Client()\n"
+            "\n"
+            "def two():\n"
+            "    return httpx.Client()\n"
+        )
+        sites = _python_egress_sites(source)
+        assert [site.guarded for site in sites] == [True, False]
+
+    def test_a_guard_in_a_sibling_branch_does_not_count(self) -> None:
+        source = (
+            "def f(flag):\n"
+            "    if flag:\n"
+            "        guard_egress('a', 'b')\n"
+            "    return httpx.Client()\n"
+        )
+        assert [site.guarded for site in _python_egress_sites(source)] == [False]
+
+    def test_a_guard_in_an_enclosing_block_does_count(self) -> None:
+        source = (
+            "def f(flag):\n"
+            "    guard_egress('a', 'b')\n"
+            "    if flag:\n"
+            "        with open('x') as fh:\n"
+            "            return httpx.Client()\n"
+        )
+        assert [site.guarded for site in _python_egress_sites(source)] == [True]
+
+    def test_a_guard_in_a_nested_function_does_not_count(self) -> None:
+        source = (
+            "def f():\n"
+            "    def inner():\n"
+            "        guard_egress('a', 'b')\n"
+            "    return httpx.Client()\n"
+        )
+        assert [site.guarded for site in _python_egress_sites(source)] == [False]
+
+    def test_a_guard_after_the_site_does_not_count(self) -> None:
+        source = "def f():\n    c = httpx.Client()\n    guard_egress('a', 'b')\n    return c\n"
+        assert [site.guarded for site in _python_egress_sites(source)] == [False]
+
+    def test_a_one_line_def_is_not_invisible(self) -> None:
+        """The previous scanner skipped any line starting with ``def``/``async
+        def`` to avoid counting a ``def _urlopen(...)`` wrapper, which also hid
+        every egress packed onto a one-line body."""
+        source = "def f(): return httpx.Client().post('https://x')\n"
+        assert [site.guarded for site in _python_egress_sites(source)] == [False]
+
+    def test_a_urlopen_wrapper_definition_is_still_not_a_call_site(self) -> None:
+        source = "def _urlopen(url):\n    return urllib.request.urlopen(url)\n"
+        sites = _python_egress_sites(source)
+        assert [site.callee for site in sites] == ["urllib.request.urlopen"]
+
+    def test_a_commented_out_client_is_not_a_site(self) -> None:
+        source = "# c = httpx.Client()\nx = 1\n"
+        assert _python_egress_sites(source) == []
+
+    def test_a_cache_only_hf_download_is_not_a_site(self) -> None:
+        source = (
+            "def f():\n"
+            "    a = hf_hub_download(r, f, local_files_only=True)\n"
+            "    return hf_hub_download(r, f)\n"
+        )
+        sites = _python_egress_sites(source)
+        assert [site.line for site in sites] == [3]
+
+    def test_a_method_named_post_is_not_requests_post(self) -> None:
+        source = "def f(self):\n    return self.client.post('/x')\n"
+        assert _python_egress_sites(source) == []
+
+    def test_module_level_httpx_verbs_are_sites(self) -> None:
+        source = "def f():\n    return httpx.get('https://x')\n"
+        assert [site.callee for site in _python_egress_sites(source)] == ["httpx.get"]
+
+
+# ─────────────────────── the Rust half of the same sweep ────────────────────
+#
+# `crates/` was outside the Python scan entirely, which is how two Rust
+# downloads (the Kompress model and the fastembed weights) sat unguarded in the
+# same PR that guarded the Rust tokenizer for exactly the stated reason. This
+# is a text scan, not an AST one: there is no Rust parser here, so "guarded"
+# means a guard_egress call earlier in the same `fn` at no deeper indentation.
+# Weaker than the Python dominance check, and deliberately so — it is a
+# review-time tripwire for a new egress path, and the runtime assertions live
+# in each crate's own `#[test]`s.
+
+_RUST_EGRESS_PATTERNS = re.compile(
+    r"""
+      hf_hub::api::(?:sync|tokio)::Api(?:Builder)?::new\(
+    | (?<![\w:])Api(?:Builder)?::new\(
+    | (?<![\w:])TextEmbedding::try_new\w*\(
+    | (?<![\w:])reqwest::(?:Client::(?:new|builder)|get|post)\(
+    | (?<![\w:])ureq::(?:agent|builder|get|post|put|delete|request)\(
+    """,
+    re.VERBOSE,
+)
+
+_RUST_FN = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?"
+    r"(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+\w"
+)
+
+_RUST_ALLOWLIST: dict[str, tuple[int, str]] = {
+    "headroom-proxy/src/proxy.rs": (
+        1,
+        "user-traffic: the reqwest client the Rust proxy forwards the caller's "
+        "own request through, the exact counterpart of the Python proxy's "
+        "allowlist entry. An air-gapped deployment points it at an on-prem "
+        "endpoint and still needs it to work.",
+    ),
+}
+
+
+def _rust_egress_sites() -> dict[str, list[_Site]]:
+    """Map ``crates/``-relative path -> egress sites, guarded or not."""
+    crates_root = REPO_ROOT / "crates"
+    found: dict[str, list[_Site]] = {}
+    for path in sorted(crates_root.glob("*/src/**/*.rs")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        # Everything from the module-level `#[cfg(test)] mod tests` on is test
+        # code: it is expected to build clients, and it never ships. Match the
+        # `mod` too — a bare `#[cfg(test)]` also decorates test-only `use`
+        # lines near the top of a file, and truncating there would blind the
+        # sweep to the entire module (it did, for headroom-proxy/src/proxy.rs).
+        for index, line in enumerate(lines):
+            if line.rstrip() != "#[cfg(test)]":
+                continue
+            following = next((nxt for nxt in lines[index + 1 :] if nxt.strip()), "")
+            if following.lstrip().startswith("mod "):
+                lines = lines[:index]
+                break
+        sites: list[_Site] = []
+        for number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if stripped.startswith(("//", "*", "#[")):
+                continue
+            match = _RUST_EGRESS_PATTERNS.search(line)
+            if not match:
+                continue
+            start = _enclosing_rust_fn(lines, number)
+            if start is None:
+                continue
+            body = lines[start : number - 1]
+            indent = len(line) - len(line.lstrip())
+            guarded = any(
+                "guard_egress(" in candidate
+                and (len(candidate) - len(candidate.lstrip())) <= indent
+                for candidate in body
+            )
+            sites.append(_Site(line=number, text=stripped, callee=match.group(0), guarded=guarded))
+        if sites:
+            found[path.relative_to(crates_root).as_posix()] = sites
+    return found
+
+
+def _enclosing_rust_fn(lines: list[str], number: int) -> int | None:
+    """Index of the line after the `fn` header enclosing line ``number``.
+
+    None when the site is inside a `#[test]`/`#[cfg(test)]` function, which the
+    sweep ignores, or when no `fn` header precedes it at all.
+    """
+    for index in range(number - 1, -1, -1):
+        if not _RUST_FN.match(lines[index]):
+            continue
+        attributes = "\n".join(lines[max(0, index - 5) : index])
+        if "#[test]" in attributes or "#[tokio::test]" in attributes:
+            return None
+        if "#[cfg(test)]" in attributes:
+            return None
+        return index + 1
+    return None
+
+
+class TestRustEgressChokepointCoverage:
+    def test_every_rust_egress_site_is_guarded_or_allowlisted(self) -> None:
+        problems: list[str] = []
+        unguarded = {
+            relpath: [site for site in sites if not site.guarded]
+            for relpath, sites in _rust_egress_sites().items()
+        }
+        unguarded = {relpath: sites for relpath, sites in unguarded.items() if sites}
+        for relpath, sites in unguarded.items():
+            entry = _RUST_ALLOWLIST.get(relpath)
+            if entry is None:
+                problems.append(
+                    _render(relpath, sites, root="crates")
+                    + "\n        (not guarded, not allowlisted)"
+                )
+                continue
+            expected, _reason = entry
+            if len(sites) != expected:
+                problems.append(
+                    _render(relpath, sites, root="crates")
+                    + f"\n        (allowlist records {expected}, found {len(sites)})"
+                )
+        assert not problems, (
+            "New or changed outbound egress found in crates/.\n\n"
+            + "\n".join(problems)
+            + _RESOLUTIONS
+        )
+
+    def test_the_guarded_rust_paths_are_seen_as_guarded(self) -> None:
+        sites = _rust_egress_sites()
+        for relpath in (
+            "headroom-core/src/tokenizer/hf_impl.rs",
+            "headroom-core/src/transforms/kompress.rs",
+            "headroom-core/src/relevance/embedding.rs",
+        ):
+            assert relpath in sites, f"{relpath} has no detected egress site at all"
+            assert all(site.guarded for site in sites[relpath]), (
+                f"{relpath} has an egress site the Rust sweep does not see as guarded"
+            )
+
+    def test_rust_allowlist_has_no_stale_entries(self) -> None:
+        unguarded = {
+            relpath
+            for relpath, sites in _rust_egress_sites().items()
+            if any(not site.guarded for site in sites)
+        }
+        stale = sorted(set(_RUST_ALLOWLIST) - unguarded)
+        assert not stale, f"Rust allowlist entries with no unguarded site; delete them: {stale}"
