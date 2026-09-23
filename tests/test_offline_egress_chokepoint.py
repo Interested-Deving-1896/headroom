@@ -534,6 +534,56 @@ class TestRefusalSurvivesFailOpenHandlers:
         )
 
 
+class TestBackgroundDownloadThreads:
+    """The two daemon threads that fetch the Kompress model are the one place
+    where propagating is the wrong answer.
+
+    They are background *refreshes*, not the request path, and an unhandled
+    ``BaseException`` in a thread reaches ``threading.excepthook`` as a bare
+    traceback — on every air-gapped startup with a cold cache. Both handle the
+    refusal explicitly and report it with the switch named, which is what
+    ``is_offline()``'s "skip an optional refresh" case is for.
+    """
+
+    def test_prefetch_reports_the_refusal_and_stops(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        import huggingface_hub
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        from headroom.transforms import kompress_compressor
+
+        attempts: list[str] = []
+
+        def fake_download(repo_id, filename, *, revision=None, local_files_only=False):
+            attempts.append(filename)
+            raise LocalEntryNotFoundError("cold cache")
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+        monkeypatch.setattr(kompress_compressor, "_kompress_cache", {})
+
+        with caplog.at_level("WARNING"):
+            assert kompress_compressor.prefetch_kompress_artifacts("acme/model") is False
+        assert "HEADROOM_OFFLINE" in caplog.text
+        # One candidate tried, then it stops: every other candidate would be
+        # refused for the same reason.
+        assert len(attempts) == 1
+
+    def test_background_download_reports_the_refusal(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        from headroom.transforms import kompress_compressor
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise OfflineEgressBlocked("HuggingFace download of acme/model", "huggingface.co")
+
+        monkeypatch.setattr(kompress_compressor, "_load_kompress", refuse)
+        with caplog.at_level("WARNING"):
+            kompress_compressor._background_download("acme/model", "cpu")
+        assert "refused" in caplog.text
+        assert "HEADROOM_OFFLINE" in caplog.text
+
+
 class TestBroadHandlerSweep:
     """``except Exception`` can no longer swallow the refusal — the type sees
     to that. ``except BaseException`` and bare ``except:`` still can, so they

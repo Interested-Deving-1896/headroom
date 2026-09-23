@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..config import TransformResult
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
@@ -1112,6 +1113,21 @@ def _background_download(model_id: str, device: str) -> None:
         logger.info("Kompress: downloading model %s in the background ...", model_id)
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
+    except OfflineEgressBlocked as blocked:
+        # Explicit, because OfflineEgressBlocked is a BaseException and would
+        # otherwise reach threading.excepthook as a bare traceback on every
+        # air-gapped startup with a cold cache. This is a background *refresh*,
+        # not the request path: the refusal is reported once, at WARNING, and
+        # the compressor keeps whatever is already cached. Do NOT widen this to
+        # `except Exception` — that is the shape the guard exists to defeat.
+        _record_download_failure(model_id)
+        logger.warning(
+            "Kompress: background model download refused for %s (%s is set): %s. "
+            "The model will only load if its artifacts are already cached.",
+            model_id,
+            OFFLINE_ENV,
+            blocked,
+        )
     except Exception as exc:
         _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
@@ -1171,6 +1187,18 @@ def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
         try:
             hf_hub_download_local_first(model_id, filename, allow_network=True)
             return True
+        except OfflineEgressBlocked as blocked:
+            # Same reasoning as _background_download: explicit because it is a
+            # BaseException, reported rather than swallowed, and terminal for
+            # the whole loop — every candidate would be refused for the same
+            # reason, so retrying them just logs the same refusal four times.
+            logger.warning(
+                "Kompress: artifact prefetch refused for %s (%s is set): %s",
+                model_id,
+                OFFLINE_ENV,
+                blocked,
+            )
+            return False
         except Exception as exc:
             logger.debug("Kompress prefetch: %r unavailable for %s: %s", filename, model_id, exc)
     return False
