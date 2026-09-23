@@ -13,6 +13,38 @@ from headroom import paths as _paths
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# A deployment profile directory holds secrets. `headroom install --env
+# KEY=VALUE` is the supported way to give a supervised proxy a provider API key
+# — supervisors (launchd, systemd, Task Scheduler, cron) start from a bare
+# environment, so nothing else reaches the process — and every such value is
+# persisted verbatim, both into `manifest.json` and into the generated runner
+# scripts that `export` it before the exec. Those files are therefore written
+# owner-only rather than at the process umask (which leaves them world-readable
+# at the common 022). The supervisor always runs them as the installing user
+# (user scope) or as root (system scope), and neither needs the group/other
+# bits, so this is not a functional restriction.
+#
+# SECURITY.md documents these modes; `tests/test_packaging_extras_and_security_docs.py`
+# reads the octal values back out of that document and compares them with what
+# an install actually writes, so the policy and the code cannot drift apart.
+SECRET_FILE_MODE = 0o600
+SECRET_SCRIPT_MODE = 0o700
+SECRET_DIR_MODE = 0o700
+
+
+def chmod_owner_only(path: Path, mode: int) -> None:
+    """Best-effort ``chmod`` to an owner-only ``mode``.
+
+    POSIX permission bits are advisory on Windows (access is governed by ACLs)
+    and some filesystems reject ``chmod`` outright; a deployment must not fail
+    to install over it, so a failure is logged by the caller's context rather
+    than raised.
+    """
+    try:
+        path.chmod(mode)
+    except OSError:  # pragma: no cover - platform/filesystem dependent
+        pass
+
 
 def validate_profile_name(profile: str) -> str:
     """Validate and normalize a deployment profile name."""

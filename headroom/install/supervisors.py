@@ -20,6 +20,9 @@ from headroom._subprocess import run
 
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
+    SECRET_FILE_MODE,
+    SECRET_SCRIPT_MODE,
+    chmod_owner_only,
     unix_ensure_script_path,
     unix_run_script_path,
     windows_ensure_cmd_path,
@@ -44,6 +47,27 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
+
+def _write_private_text(path: Path, data: str, mode: int) -> None:
+    """Write ``data`` to ``path`` without ever exposing it at the umask.
+
+    The runner scripts ``export`` every entry of ``manifest.base_env`` in
+    cleartext, and ``headroom install --env KEY=VALUE`` is the supported way to
+    put a provider API key there, so these files are secret-bearing. Creating
+    the file with :func:`os.open` and an explicit mode — rather than writing
+    first and chmod'ing after — closes the window in which a world-readable
+    file holding a live API key exists on disk. An existing file keeps its old
+    mode through ``O_TRUNC``, so chmod afterwards as well to narrow scripts
+    written by an earlier version.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # Newline handling is left at the default so the bytes written match what
+    # `Path.write_text` produced before, on every platform.
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(data)
+    chmod_owner_only(path, mode)
 
 
 def _validated_env_items(env: dict[str, str] | None) -> list[tuple[str, str]]:
@@ -100,14 +124,19 @@ def _render_unix_runner(
     export_lines = "".join(
         f"export {name}={shlex.quote(value)}\n" for name, value in _validated_env_items(env)
     )
-    path.write_text(
+    # 0700, not 0755: `export_lines` can contain a provider API key in
+    # cleartext (see `_write_private_text`). The supervisor runs this script as
+    # the installing user for a user-scope install and as root for a
+    # system-scope one, so dropping group/other loses nothing.
+    _write_private_text(
+        path,
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         + export_lines
         + "exec "
         + " ".join(shlex.quote(x) for x in command)
-        + "\n"
+        + "\n",
+        SECRET_SCRIPT_MODE,
     )
-    path.chmod(0o755)
     return ArtifactRecord(kind="script", path=str(path))
 
 
@@ -123,9 +152,17 @@ def _render_windows_runner(
     env_lines = "".join(
         f"$env:{name} = {_powershell_literal(value)}\n" for name, value in _validated_env_items(env)
     )
-    ps1_path.write_text(
-        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n"
+    # The .ps1 carries `$env:` assignments that can include a provider API key,
+    # so it is owner-only like its POSIX counterpart. Windows resolves access
+    # by ACL rather than by these bits, but the mode still matters when the
+    # profile directory is read from WSL, a backup, or a synced home.
+    _write_private_text(
+        ps1_path,
+        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n",
+        SECRET_FILE_MODE,
     )
+    # The .cmd shim holds no secrets — it only invokes the .ps1 — so it keeps a
+    # conventional mode.
     cmd_path.write_text(
         '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0'
         + ps1_path.name

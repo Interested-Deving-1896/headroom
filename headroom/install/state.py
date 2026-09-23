@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from .models import ArtifactRecord, DeploymentManifest, ManagedMutation, iso_utc_now
-from .paths import deploy_root, manifest_path, profile_root
+from .paths import (
+    SECRET_DIR_MODE,
+    SECRET_FILE_MODE,
+    chmod_owner_only,
+    deploy_root,
+    manifest_path,
+    profile_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,15 @@ def _atomic_write_text(path: Path, data: str) -> None:
     both POSIX and Windows). A crash between truncate and full write therefore
     leaves either the previous file or the complete new one on disk, never a
     truncated manifest.
+
+    The file is owner-only. ``manifest.base_env`` holds whatever
+    ``headroom install --env KEY=VALUE`` was given, and that is the supported
+    way to hand a provider API key to a supervised proxy (supervisors start
+    from a bare environment), so the manifest must be assumed to contain
+    secrets. :func:`tempfile.mkstemp` already creates the temporary file 0600
+    and :func:`os.replace` carries that mode across, but the chmod is explicit
+    so the guarantee survives a future rewrite of this function and is pinned
+    by a test rather than inherited by accident.
     """
     directory = path.parent
     fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".tmp")
@@ -38,6 +54,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        chmod_owner_only(tmp_path, SECRET_FILE_MODE)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -50,10 +67,19 @@ def save_manifest(manifest: DeploymentManifest) -> None:
     The write is atomic so an interrupted save (SIGKILL, system restart, OOM)
     cannot leave a truncated ``manifest.json`` behind. Gracefully handles
     read-only filesystems by logging a warning instead of crashing.
+
+    The profile directory and the manifest are owner-only: ``base_env`` carries
+    whatever ``headroom install --env`` was given, which is the supported way to
+    hand a provider API key to a supervised proxy. See
+    :data:`headroom.install.paths.SECRET_DIR_MODE`.
     """
     try:
         root = profile_root(manifest.profile)
         root.mkdir(parents=True, exist_ok=True)
+        # `exist_ok=True` leaves a pre-existing directory's mode alone, and a
+        # profile created before this change is 0755, so narrow it every save
+        # rather than only at creation.
+        chmod_owner_only(root, SECRET_DIR_MODE)
         manifest.updated_at = iso_utc_now()
         path = manifest_path(manifest.profile)
         _atomic_write_text(path, json.dumps(asdict(manifest), indent=2) + "\n")
