@@ -25,12 +25,27 @@ import os
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
+# Whitespace trimmed off the raw value before matching. Enumerated rather than
+# left to ``str.strip()``'s default, because that default is Python's
+# ``str.isspace()`` — which includes U+001C-U+001F (the ASCII file/group/record
+# /unit separators) — while Rust's ``str::trim()`` is the Unicode White_Space
+# property, which does not. ``HEADROOM_OFFLINE=$'\x1c1'`` therefore read as
+# offline to Python and online to Rust: one process air-gapped, the other not,
+# from one environment variable. Neither side's default is more right than the
+# other, so both now trim exactly this set. Mirrored by ``TRIM_CHARS`` in
+# ``crates/headroom-core/src/offline.rs``; the parity test compares them.
+#
+# Case folding needs no such treatment: Python's ``str.lower()`` and Rust's
+# ``to_ascii_lowercase()`` differ only on non-ASCII input, and no non-ASCII
+# character lowercases into any character of "1"/"true"/"yes"/"on".
+_TRIM_CHARS = " \t\n\r\x0b\x0c"
+
 OFFLINE_ENV = "HEADROOM_OFFLINE"
 
 
 def is_offline() -> bool:
     """Return True when ``HEADROOM_OFFLINE`` selects fully-offline operation."""
-    return os.environ.get(OFFLINE_ENV, "").strip().lower() in _TRUE_VALUES
+    return os.environ.get(OFFLINE_ENV, "").strip(_TRIM_CHARS).lower() in _TRUE_VALUES
 
 
 def apply_offline_env() -> None:

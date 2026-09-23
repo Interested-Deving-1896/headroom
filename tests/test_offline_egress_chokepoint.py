@@ -359,6 +359,76 @@ class TestRustOfflineParity:
             "other is exactly the hole this switch is supposed to close."
         )
 
+    def test_trim_chars_match_the_python_side(self) -> None:
+        """Value parity is only half of it.
+
+        The old pair diffed the accepted token sets and nothing else, so it was
+        green while Python used ``str.strip()`` (which strips U+001C-U+001F)
+        and Rust used ``str::trim()`` (which does not). Normalisation is part
+        of the contract; this pins the set both sides trim.
+        """
+        from headroom.offline import _TRIM_CHARS
+
+        source = _RUST_OFFLINE.read_text(encoding="utf-8")
+        match = re.search(r"const TRIM_CHARS: \[char; \d+\] = \[(.*?)\];", source, re.DOTALL)
+        assert match, "TRIM_CHARS not found in crates/headroom-core/src/offline.rs"
+        rust_chars = set()
+        for literal in re.findall(r"'((?:\\u\{[0-9a-fA-F]+\}|\\.|[^'])+)'", match.group(1)):
+            escape = re.fullmatch(r"\\u\{([0-9a-fA-F]+)\}", literal)
+            if escape:
+                rust_chars.add(chr(int(escape.group(1), 16)))
+            else:
+                rust_chars.add({"\\t": "\t", "\\n": "\n", "\\r": "\r"}.get(literal, literal))
+        assert rust_chars == set(_TRIM_CHARS), (
+            "HEADROOM_OFFLINE trimming has drifted between Python and Rust. "
+            f"python={sorted(map(ord, _TRIM_CHARS))} rust={sorted(map(ord, rust_chars))}. "
+            "A value that normalises differently in the two runtimes air-gaps "
+            "one half of the process and not the other."
+        )
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("1", True),
+            (" 1 ", True),
+            ("\t1\n", True),
+            ("\r\n TRUE \r\n", True),
+            ("\x0byes\x0c", True),
+            # U+001C-U+001F: whitespace to str.strip(), not to str::trim().
+            # This pair is the regression the token-set diff could not see.
+            ("\x1c1", False),
+            ("1\x1f", False),
+            # Unicode spaces: whitespace to str::trim(), and (NBSP) to
+            # str.strip() as well. Neither trims them now.
+            ("\xa01", False),
+            ("\u2007on", False),
+            ("", False),
+            (" ", False),
+        ],
+    )
+    def test_normalisation_matches_the_rust_side(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+    ) -> None:
+        """Same table as ``offline::tests::normalisation_matches_python``.
+
+        Duplicated rather than shared because the point is that two separate
+        implementations agree; a shared fixture would only prove one of them
+        reads the fixture.
+        """
+        from headroom.offline import is_offline
+
+        monkeypatch.setenv("HEADROOM_OFFLINE", raw)
+        assert is_offline() is expected
+
+    def test_the_rust_normalisation_table_covers_the_same_cases(self) -> None:
+        """If one side's table grows a case the other lacks, the pair stops
+        being a parity test and becomes two independent tests that happen to
+        share a name."""
+        source = _RUST_OFFLINE.read_text(encoding="utf-8")
+        assert "fn normalisation_matches_python()" in source
+        for needle in ('"\\u{1c}1"', '"1\\u{1f}"', '"\\u{a0}1"', '"\\u{2007}on"'):
+            assert needle in source, f"rust normalisation table is missing {needle}"
+
     def test_hf_fetch_guards_before_it_builds_a_client(self) -> None:
         source = _RUST_HF.read_text(encoding="utf-8")
         assert "guard_egress(" in source, "hf_impl.rs does not consult the offline guard"

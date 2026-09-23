@@ -23,6 +23,15 @@
 //! `_TRUE_VALUES`, and vice versa: the two implementations are a pair, and a
 //! deployment that reads as offline to Python but online to Rust is precisely
 //! the failure this module exists to prevent.
+//!
+//! The parity covers **normalisation**, not just the accepted values. This
+//! used to call `str::trim()` while Python called `str.strip()`, and those are
+//! not the same set: Python's strips U+001C-U+001F (the ASCII file/group/
+//! record/unit separators) because `str.isspace()` includes them, Rust's does
+//! not because the Unicode `White_Space` property does not. `HEADROOM_OFFLINE`
+//! set to `"\x1c1"` read as offline to Python and online to Rust — one
+//! environment variable, one process air-gapped and the other not. Both sides
+//! now trim exactly [`TRIM_CHARS`].
 
 use std::env;
 
@@ -34,6 +43,12 @@ pub const OFFLINE_ENV: &str = "HEADROOM_OFFLINE";
 /// Values that read as "yes, offline". Kept byte-identical to the Python
 /// side's `_TRUE_VALUES` (see the parity contract in the module docs).
 const TRUE_VALUES: [&str; 4] = ["1", "true", "yes", "on"];
+
+/// Whitespace trimmed off the raw value before matching. Enumerated rather
+/// than left to `str::trim()`, which is the Unicode `White_Space` property and
+/// does not agree with Python's `str.strip()`. Kept byte-identical to the
+/// Python side's `_TRIM_CHARS` (see the parity contract in the module docs).
+const TRIM_CHARS: [char; 6] = [' ', '\t', '\n', '\r', '\u{b}', '\u{c}'];
 
 /// An egress attempt was refused because `HEADROOM_OFFLINE` is in force.
 ///
@@ -55,7 +70,7 @@ pub struct OfflineEgressBlocked {
 pub fn is_offline() -> bool {
     match env::var(OFFLINE_ENV) {
         Ok(raw) => {
-            let normalized = raw.trim().to_ascii_lowercase();
+            let normalized = raw.trim_matches(TRIM_CHARS.as_slice()).to_ascii_lowercase();
             TRUE_VALUES.contains(&normalized.as_str())
         }
         // Unset, or not valid UTF-8 — neither is an opt-in to offline mode.
@@ -112,6 +127,36 @@ mod tests {
         for raw in ["", "0", "off", "no", "false", "maybe", " "] {
             env::set_var(OFFLINE_ENV, raw);
             assert!(!is_offline(), "{raw:?} should read as online");
+        }
+        env::remove_var(OFFLINE_ENV);
+    }
+
+    /// Normalisation parity, not just value parity. Every case here is
+    /// duplicated verbatim in `tests/test_offline_egress_chokepoint.py`'s
+    /// `test_normalisation_matches_the_rust_side`, and the two must agree.
+    ///
+    /// The `\x1c` cases are the regression: they are whitespace to Python's
+    /// `str.strip()` and not to Rust's `str::trim()`, so before `TRIM_CHARS`
+    /// existed `"\x1c1"` air-gapped the Python proxy and left the Rust core
+    /// dialling out.
+    #[test]
+    fn normalisation_matches_python() {
+        let _guard = env_lock();
+        for (raw, expected) in [
+            ("1", true),
+            (" 1 ", true),
+            ("\t1\n", true),
+            ("\r\n TRUE \r\n", true),
+            ("\u{b}yes\u{c}", true),
+            ("\u{1c}1", false),
+            ("1\u{1f}", false),
+            ("\u{a0}1", false),
+            ("\u{2007}on", false),
+            ("", false),
+            (" ", false),
+        ] {
+            env::set_var(OFFLINE_ENV, raw);
+            assert_eq!(is_offline(), expected, "{raw:?}");
         }
         env::remove_var(OFFLINE_ENV);
     }
