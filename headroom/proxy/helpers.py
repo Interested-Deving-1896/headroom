@@ -3148,7 +3148,6 @@ _TOOL_SEARCH_TOOL_TYPE_PREFIX = "tool_search_tool_"
 _TOOL_SEARCH_BETA_MARKERS = ("advanced-tool-use", "tool-search-tool")
 
 _tool_search_hint_lock = threading.Lock()
-_tool_search_hint_emitted = False
 #: Re-arm interval for the tool-search-disabled warning. It used to fire exactly
 #: once per process, which on a proxy that stays up for weeks means one line in
 #: the log at startup and silence thereafter — the condition it reports persists
@@ -3157,6 +3156,10 @@ _tool_search_hint_emitted = False
 #: operator tailing logs will see it, rare enough that it is not noise.
 _TOOL_SEARCH_HINT_INTERVAL_S = 3600.0
 _tool_search_hint_last: float | None = None
+# Module-level indirection over the clock so tests can drive it without
+# monkeypatching stdlib ``time.monotonic``, which would freeze it for every
+# other thread in the process. Same pattern as savings_tracker.
+_monotonic = time.monotonic
 
 
 def claude_code_tool_search_inactive(
@@ -3210,38 +3213,45 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
 
 
 def tool_search_hint_pending() -> bool:
-    """Cheap, lock-free check of whether the hint may fire now.
+    """Cheap, lock-free check of whether the detection scan may run now.
 
-    Lets the request hot path skip the (O(number-of-tools)) detection scan on
-    every request while the hint is throttled. A benign race here only costs one
-    extra detection scan, never a duplicate warning — the rate limit itself
-    lives in :func:`take_tool_search_hint_slot`.
+    Lets the request hot path skip the O(number-of-tools) scan while the hint
+    is throttled. A benign race here only costs one extra scan, never a
+    duplicate warning — the rate limit itself lives in
+    :func:`take_tool_search_scan_slot`.
     """
     last = _tool_search_hint_last
-    return last is None or (time.monotonic() - last) >= _TOOL_SEARCH_HINT_INTERVAL_S
+    return last is None or (_monotonic() - last) >= _TOOL_SEARCH_HINT_INTERVAL_S
 
 
-def take_tool_search_hint_slot() -> bool:
-    """Return ``True`` at most once per ``_TOOL_SEARCH_HINT_INTERVAL_S``.
+def take_tool_search_scan_slot() -> bool:
+    """Claim the right to run the detection scan, at most once per interval.
 
-    Thread-safe so concurrent requests cannot each emit the warning.
+    The window governs SCANS, not emissions, and that distinction is
+    load-bearing. Stamping only when the hint actually fires means that once the
+    operator FIXES the condition the stamp stops advancing, ``pending`` stays
+    true forever, and every subsequent request pays the full scan over the
+    client's tool array for the life of the process — the opposite of the gate's
+    purpose, and worst on exactly the large tool surfaces this targets.
+
+    Claiming the slot before the scan also collapses the old two-call protocol
+    into one, so there is no window in which two threads both scan and both
+    emit.
     """
-    global _tool_search_hint_emitted, _tool_search_hint_last
+    global _tool_search_hint_last
     if not tool_search_hint_pending():
         return False
     with _tool_search_hint_lock:
         if not tool_search_hint_pending():
             return False
-        _tool_search_hint_last = time.monotonic()
-        _tool_search_hint_emitted = True
+        _tool_search_hint_last = _monotonic()
         return True
 
 
 def reset_tool_search_hint_state() -> None:
     """Reset the hint rate limit. Test helper only."""
-    global _tool_search_hint_emitted, _tool_search_hint_last
+    global _tool_search_hint_last
     with _tool_search_hint_lock:
-        _tool_search_hint_emitted = False
         _tool_search_hint_last = None
 
 
@@ -3258,6 +3268,14 @@ def reset_tool_search_hint_state() -> None:
 # counting as input tokens until the model searches for one), while every tool
 # stays callable. Deterministic output → the tools prefix still prompt-caches.
 # ---------------------------------------------------------------------------
+
+# Resident no matter what the operator's override says. The client's own
+# tool-search tool is the one thing that must never be deferred: it is what
+# loads the tools it resolves, and Claude Code uses it to reach tools held in a
+# local registry (TaskCreate, WebFetch, ...) that nothing else can reach. An
+# override says which ORDINARY tools stay inline, so letting it drop this would
+# silently orphan a whole category rather than defer it.
+_CLIENT_SIDE_SEARCH_FLOOR = frozenset({"toolsearch"})
 
 # Core coding tools kept non-deferred so routine edit/read/run loops never pay a
 # search round-trip. Everything else (Slack/Linear/Sentry/Notion/Snowflake/…) is
@@ -3300,7 +3318,19 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
 CORE_TOOLS_ENV = "HEADROOM_TOOL_SEARCH_CORE_TOOLS"
 CORE_TOOLS_ENV_LEGACY = "HEADROOM_TOOL_SEARCH_CORE"
 
+_core_tools_legacy_lock = threading.Lock()
 _core_tools_legacy_warned = False
+
+
+def reset_core_tools_legacy_warn_state() -> None:
+    """Re-arm the legacy-variable warning. Test helper only.
+
+    Without this the flag leaks between tests in a process, so a caplog
+    assertion on this warning passes alone and fails depending on ordering.
+    """
+    global _core_tools_legacy_warned
+    with _core_tools_legacy_lock:
+        _core_tools_legacy_warned = False
 
 
 def _core_tools_override() -> str | None:
@@ -3310,8 +3340,15 @@ def _core_tools_override() -> str | None:
     if raw is not None:
         return raw
     legacy = os.environ.get(CORE_TOOLS_ENV_LEGACY)
-    if legacy is not None and not _core_tools_legacy_warned:
-        _core_tools_legacy_warned = True
+    should_warn = False
+    if legacy is not None:
+        # Check-and-set under the lock: unguarded, two threads racing on their
+        # first request could both warn.
+        with _core_tools_legacy_lock:
+            if not _core_tools_legacy_warned:
+                _core_tools_legacy_warned = True
+                should_warn = True
+    if should_warn:
         logger.warning(
             "event=tool_search_core_env_legacy old=%s new=%s "
             "hint=honoring the legacy variable; rename it, both paths read the new one",
@@ -3349,8 +3386,19 @@ def resolved_core_tools(extra: frozenset[str] = frozenset()) -> frozenset[str]:
 
     raw = _core_tools_override()
     if raw is None:
+        if not extra:
+            return _TOOL_SEARCH_CORE_TOOLS
         return _TOOL_SEARCH_CORE_TOOLS | {_tool_search_resident_key(name) for name in extra}
-    return frozenset(_tool_search_resident_key(part) for part in raw.split(",") if part.strip())
+    # ``part.strip()`` before keying, not just for the emptiness test: the key
+    # function lowercases and strips leading underscores but NOT spaces, so the
+    # natural spelling "bash, read, terminal" used to resolve to {" read",
+    # " terminal", "bash"} and defer the two tools the operator asked to pin.
+    named = {_tool_search_resident_key(part.strip()) for part in raw.split(",") if part.strip()}
+    # The client's own tool-search tool survives every override. Deferring it
+    # hides the only thing that can load the tools it resolves -- including
+    # tools the client keeps in a local registry, which nothing else can reach
+    # -- so an override that omits it would silently orphan them.
+    return frozenset(named | _CLIENT_SIDE_SEARCH_FLOOR)
 
 
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
@@ -3455,7 +3503,7 @@ def _client_tool_search_names() -> frozenset[str]:
     if not extra.strip():
         return _CLIENT_TOOL_SEARCH_NAMES
     return _CLIENT_TOOL_SEARCH_NAMES | {
-        _tool_search_resident_key(part) for part in extra.split(",") if part.strip()
+        _tool_search_resident_key(part.strip()) for part in extra.split(",") if part.strip()
     }
 
 

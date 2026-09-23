@@ -184,7 +184,7 @@ def test_resident_set_is_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
     """So deferring built-ins can be measured instead of guessed."""
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "bash,read")
 
-    assert resolved_core_tools() == frozenset({"bash", "read"})
+    assert resolved_core_tools() == frozenset({"bash", "read", "toolsearch"})
 
     tools = [
         {"name": "bash", "input_schema": {}},
@@ -402,16 +402,16 @@ def test_hint_rearms_after_the_interval(monkeypatch: pytest.MonkeyPatch) -> None
     H.reset_tool_search_hint_state()
     try:
         clock = {"t": 1000.0}
-        monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
+        monkeypatch.setattr(H, "_monotonic", lambda: clock["t"])
 
-        assert H.take_tool_search_hint_slot() is True
-        assert H.take_tool_search_hint_slot() is False
+        assert H.take_tool_search_scan_slot() is True
+        assert H.take_tool_search_scan_slot() is False
 
         clock["t"] += H._TOOL_SEARCH_HINT_INTERVAL_S - 1
-        assert H.take_tool_search_hint_slot() is False, "must not re-arm early"
+        assert H.take_tool_search_scan_slot() is False, "must not re-arm early"
 
         clock["t"] += 2
-        assert H.take_tool_search_hint_slot() is True, "must re-arm after the interval"
+        assert H.take_tool_search_scan_slot() is True, "must re-arm after the interval"
     finally:
         H.reset_tool_search_hint_state()
 
@@ -430,14 +430,14 @@ def test_legacy_env_var_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE", "bash,read")
 
-    assert resolved_core_tools() == frozenset({"bash", "read"})
+    assert resolved_core_tools() == frozenset({"bash", "read", "toolsearch"})
 
 
 def test_canonical_env_var_wins_over_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE", "bash,read")
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "grep")
 
-    assert resolved_core_tools() == frozenset({"grep"})
+    assert resolved_core_tools() == frozenset({"grep", "toolsearch"})
 
 
 def test_neither_set_keeps_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -452,4 +452,56 @@ def test_empty_override_defers_everything_non_typed(monkeypatch: pytest.MonkeyPa
     """An explicit empty set is a real instruction, not an unset variable."""
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "")
 
-    assert resolved_core_tools() == frozenset()
+    assert resolved_core_tools() == frozenset({"toolsearch"})
+
+
+def test_the_override_tolerates_spaces_after_commas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The natural spelling of a list must not defer the tools it names.
+
+    The key function lowercases and strips leading underscores but not spaces,
+    so ``"bash, read, terminal"`` resolved to ``{" read", " terminal", "bash"}``
+    and deferred exactly the two tools the operator asked to keep resident.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "bash, read , terminal")
+
+    assert resolved_core_tools() == frozenset({"bash", "read", "terminal", "toolsearch"})
+
+
+def test_an_override_cannot_defer_the_clients_search_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferring ToolSearch hides the only thing that can load what it resolves.
+
+    Claude Code reaches tools held in a local registry through it, and nothing
+    else can. An override names which ORDINARY tools stay inline, so honouring
+    one that omits this would orphan a whole category rather than defer it.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH_CORE_TOOLS", "Bash,Read")
+    tools = [CLAUDE_CODE_TOOL_SEARCH, {"name": "Bash", "input_schema": {}}, *_mcp(14)]
+
+    by_name = {t.get("name"): t for t in inject_tool_search_deferral(tools) if isinstance(t, dict)}
+
+    assert by_name["ToolSearch"].get("defer_loading") is None
+    assert by_name["mcp__srv0__do"].get("defer_loading") is True
+
+
+def test_the_scan_gate_closes_even_when_the_hint_does_not_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the operator FIXES the condition, the scan must stop running.
+
+    Stamping the window only on emission meant the gate stayed open forever
+    after the fix, so every later request paid the full O(tools) scan for the
+    life of the process -- worst on the large tool surfaces this targets.
+    """
+    from headroom.proxy import helpers as H
+
+    H.reset_tool_search_hint_state()
+    try:
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(H, "_monotonic", lambda: clock["t"])
+
+        assert H.take_tool_search_scan_slot() is True  # scanned; found nothing
+        assert H.tool_search_hint_pending() is False  # ...and the gate closed anyway
+    finally:
+        H.reset_tool_search_hint_state()
