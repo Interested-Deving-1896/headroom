@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.27.x (latest) | :white_check_mark: |
-| < 0.27.x | :x:              |
+| 0.38.x (latest) | :white_check_mark: |
+| < 0.38.x | :x:              |
 
 ## Reporting a Vulnerability
 
@@ -57,7 +57,12 @@ The following are out of scope:
 
 Headroom includes several security features:
 
-- **No credential storage**: We never store or log API keys
+- **Credential handling**: Provider API keys are read from the environment and
+  forwarded upstream; Headroom does not write them to disk. One credential is
+  persisted deliberately: `headroom copilot login` stores the GitHub Copilot
+  OAuth refresh token in `~/.headroom/copilot_auth.json`, created with mode
+  `0600`. Request and response bodies may be written to the runtime log when
+  logging is enabled, so treat that log as sensitive.
 - **Passthrough mode**: Sensitive content passes through unchanged by default
 - **Input validation**: All inputs are validated before processing
 - **Safe defaults**: Security-conscious defaults out of the box
