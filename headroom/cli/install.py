@@ -23,7 +23,7 @@ from headroom.install.models import (
     RuntimeKind,
     SupervisorKind,
 )
-from headroom.install.planner import build_manifest
+from headroom.install.planner import build_manifest, build_tool_envs
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
@@ -204,7 +204,49 @@ def _deactivate_deployment_mutations(
         save_manifest(manifest)
 
 
+def _reconcile_tool_envs(manifest: DeploymentManifest) -> dict[str, list[str]]:
+    """Add managed env vars introduced since this manifest was written.
+
+    ``tool_envs`` is built once, by ``build_manifest`` during ``headroom
+    install``, and then stored. Every later lifecycle command re-applies the
+    STORED map, so a variable added to a provider's install env afterwards never
+    reaches a deployment that already exists -- not on ``start``, not on
+    ``restart``, and not on a Headroom upgrade. The only cure was reinstalling,
+    which nobody does for a proxy that is working.
+
+    That is not hypothetical. ``ENABLE_TOOL_SEARCH`` was added to Claude's
+    install env on 2026-06-19 to stop Claude Code inlining every MCP schema when
+    it sees a custom ``ANTHROPIC_BASE_URL`` (GH #746). A deployment installed
+    before that date keeps getting the base URL written without it, so the
+    client is pointed at the proxy AND has its own tool-schema deferral switched
+    off -- the expensive half of the change with none of the mitigation.
+
+    Missing keys are ADDED; existing values are never overwritten. The stored
+    value may legitimately differ from a fresh build (a hand-edited port, a
+    deployment pinned to something specific), and healing an omission is a much
+    smaller claim than re-deciding a setting the manifest already records.
+    Returns the names added per target, for reporting.
+    """
+
+    added: dict[str, list[str]] = {}
+    current = build_tool_envs(manifest.port, manifest.backend, list(manifest.targets))
+    for target, values in current.items():
+        stored = manifest.tool_envs.get(target)
+        if stored is None:
+            manifest.tool_envs[target] = dict(values)
+            if values:
+                added[target] = sorted(values)
+            continue
+        missing = {name: value for name, value in values.items() if name not in stored}
+        if missing:
+            stored.update(missing)
+            added[target] = sorted(missing)
+    return added
+
+
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
+    for target, names in sorted(_reconcile_tool_envs(manifest).items()):
+        click.echo(f"Applying newer managed settings for {target}: {', '.join(names)}")
     manifest.mutations = apply_mutations(manifest)
     save_manifest(manifest)
 
