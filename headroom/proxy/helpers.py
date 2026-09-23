@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -3142,6 +3142,26 @@ def compute_turn_id(
 # ---------------------------------------------------------------------------
 
 _TOOL_SEARCH_TOOL_TYPE_PREFIX = "tool_search_tool_"
+# Every wire spelling of "this client is already deferring its tool schemas".
+# Deferral is no longer an Anthropic-only feature: Codex and the Responses API
+# use a bare ``tool_search`` type that carries no ``name`` at all, GitHub
+# Copilot CLI ships ``tool_search_tool``, VS Code Copilot and Kiro use
+# ``tool_search``, and Codebuff uses ``composio_search_tools``. Matching only
+# Anthropic's versioned ``tool_search_tool_*`` prefix misses all of them --
+# including the exact string ``tool_search_tool``, which does not start with
+# ``tool_search_tool_``.
+_RESPONSES_TOOL_SEARCH_TYPE = "tool_search"
+_TOOL_SEARCH_META_TOOL_NAMES = frozenset(
+    {
+        _RESPONSES_TOOL_SEARCH_TYPE,
+        "tool_search_tool",
+        "tool_search_tool_regex",
+        "composio_search_tools",
+    }
+)
+# Responses lets a client group tools under one entry that carries the real
+# tools in a nested ``tools`` array; Codex ships its MCP servers that way.
+_NAMESPACE_TOOL_TYPE = "namespace"
 # Substrings of the ``anthropic-beta`` tokens that gate tool search:
 # ``advanced-tool-use-2025-11-20`` (firstParty/foundry) and
 # ``tool-search-tool-2025-10-19`` (vertex/bedrock/mantle/gateway).
@@ -3507,14 +3527,71 @@ def _client_tool_search_names() -> frozenset[str]:
     }
 
 
+def iter_tool_entries(tools: Any) -> Iterator[dict[str, Any]]:
+    """Yield every tool dict in ``tools``, descending into namespace groups.
+
+    A Responses client may group tools under
+    ``{"type": "namespace", "name": ..., "tools": [...]}`` and Codex ships its
+    MCP servers that way. A scan that reads only top-level ``tools[].name``
+    sees the wrapper and none of the tools inside it, so every nested tool is
+    invisible to both deferral detection and the resident/defer decision --
+    and a namespace is exactly where a large MCP catalog lives.
+
+    One level is what the API defines, and that is all this descends; a nested
+    ``tools`` value that is not a list is skipped rather than trusted.
+    """
+
+    if not isinstance(tools, list):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        yield tool
+        if tool.get("type") != _NAMESPACE_TOOL_TYPE:
+            continue
+        for nested in tool.get("tools") or []:
+            if isinstance(nested, dict):
+                yield nested
+
+
+def _is_tool_search_meta_tool(tool: dict[str, Any]) -> bool:
+    """Whether one tool entry is a tool-search meta-tool, in any known spelling."""
+
+    ttype = str(tool.get("type", ""))
+    if ttype.startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX) or ttype in _TOOL_SEARCH_META_TOOL_NAMES:
+        return True
+    name = _tool_search_resident_key(tool.get("name"))
+    return (
+        name.startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        or name in _TOOL_SEARCH_META_TOOL_NAMES
+        or name in _client_tool_search_names()
+    )
+
+
 def request_already_defers_tools(tools: Any) -> bool:
     """Whether ``tools`` shows the CLIENT is already deferring tool schemas.
 
-    True for the Messages API server-side shape (``tool_search_tool_*`` as
-    either ``type`` or ``name``), which only appears when deferral is actually
-    on. NOT true for a bare client-side tool name such as ``ToolSearch``, which
-    a client may send whether or not it is deferring — see
+    Keyed on wire shape, never on a client allowlist, so it generalizes to
+    harnesses we have not seen. Three independent signals, any of which is
+    conclusive:
+
+    * a tool-search meta-tool in any known spelling -- Anthropic's versioned
+      ``tool_search_tool_*``, the Responses/Codex bare ``tool_search`` type
+      (which carries no ``name`` at all), Copilot's ``tool_search_tool``;
+    * ``defer_loading`` already set on any tool, which is the client marking
+      its own catalog deferred and is shape-independent;
+    * either of the above on a tool nested inside a ``namespace`` entry.
+
+    NOT true for a bare client-side tool name such as ``ToolSearch``, which a
+    client may send whether or not it is deferring -- see
     ``_CLIENT_TOOL_SEARCH_NAMES``.
+
+    Deferring on top of a client that already defers suppresses ITS mechanism
+    and inlines the catalog we were trying to keep out, so a miss here costs
+    real tokens. That is no longer a rare case: Codex, GitHub Copilot CLI, VS
+    Code Copilot, Kiro and Codebuff all ship their own tool search, and on
+    Copilot's Anthropic path the provider's server-side search can be a third
+    mechanism in the same request.
 
     Upstream-independent on purpose: the question is what the client is doing,
     not where the request is forwarded, so the same answer holds for first-party
@@ -3523,15 +3600,8 @@ def request_already_defers_tools(tools: Any) -> bool:
     deferral is the only one available.
     """
 
-    if not isinstance(tools, list):
-        return False
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX):
-            return True
-        name = _tool_search_resident_key(tool.get("name"))
-        if name.startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX) or name in _client_tool_search_names():
+    for tool in iter_tool_entries(tools):
+        if tool.get("defer_loading") is True or _is_tool_search_meta_tool(tool):
             return True
     return False
 
@@ -3967,7 +4037,7 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 #   * No ``cache_control`` (OpenAI caches automatically), so no breakpoint move.
 # ---------------------------------------------------------------------------
 
-_OPENAI_TOOL_SEARCH_TYPE = "tool_search"
+_OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
@@ -4034,16 +4104,19 @@ def inject_tool_search_deferral_openai(
         return tools
     if not _model_supports_openai_tool_search(model):
         return tools
-    if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
+    if not isinstance(tools, list):
         return tools
-    if any(
-        isinstance(tool, dict) and tool.get("type") == _OPENAI_TOOL_SEARCH_TYPE for tool in tools
-    ) or request_already_defers_tools(tools):
-        # Client already defers — its own Responses tool_search, or a
-        # client-side tool such as Claude Code's ToolSearch. Deferring on top of
+    # Count nested namespace members too. A client that groups a 30-tool MCP
+    # catalog under one namespace entry presents a handful of top-level entries,
+    # so a top-level-only count reads it as a small tool surface and skips
+    # exactly the request with the most schema to save.
+    if sum(1 for _ in iter_tool_entries(tools)) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
+        return tools
+    if request_already_defers_tools(tools):
+        # Client already defers — its own Responses tool_search, Copilot's
+        # tool_search_tool, or defer_loading it set itself. Deferring on top of
         # a client that is already deferring suppresses ITS mechanism and
-        # inlines the catalog we were trying to keep out. Shape-based, not a
-        # client allowlist, so it generalizes to harnesses we have not seen.
+        # inlines the catalog we were trying to keep out.
         return tools
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]

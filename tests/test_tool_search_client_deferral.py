@@ -5,7 +5,13 @@ Two mechanisms exist at two layers:
 * **Server-side (Messages API / Responses).** ``tool_search_tool_regex`` /
   ``tool_search_tool_bm25`` types paired with ``defer_loading: true``, or
   OpenAI's ``{"type": "tool_search"}``. This shape appears ONLY when deferral
-  is actually on, so it is an unambiguous signal.
+  is actually on, so it is an unambiguous signal. It has no single spelling:
+  a survey of shipped harnesses found tool search of their own in Codex
+  (``tool_search``, a type with no ``name`` at all), GitHub Copilot CLI
+  (``tool_search_tool``), VS Code Copilot and Kiro (``tool_search``) and
+  Codebuff (``composio_search_tools``) — so the client already deferring is
+  the common case, not the exception, and ``defer_loading`` on any tool is
+  the one signal that needs no agreement about names.
 * **Client-side.** Claude Code carries a tool named ``ToolSearch``. It resolves
   tools the client keeps in a local registry (TaskCreate, WebFetch, ...) and
   real traffic shows it riding alongside a fully inline MCP catalog. Its
@@ -34,6 +40,7 @@ from headroom.proxy.helpers import (
     claude_code_tool_search_inactive,
     inject_tool_search_deferral,
     inject_tool_search_deferral_openai,
+    iter_tool_entries,
     request_already_defers_tools,
     resolved_core_tools,
     strip_first_party_tool_search_tools_for_third_party_upstream,
@@ -110,13 +117,118 @@ def test_server_side_shape_means_the_client_defers(marker: dict[str, Any]) -> No
         pytest.param(None, id="not-a-list"),
         pytest.param([{"name": "mcp__search__tools"}], id="mcp-tool-named-search"),
         pytest.param([{"name": "SearchTool"}], id="reversed-words"),
-        pytest.param([{"name": "tool_search"}], id="prefix-but-incomplete"),
         pytest.param([{"type": "web_search"}], id="unrelated-server-tool"),
         pytest.param(["not-a-dict", 7], id="non-dict-entries"),
     ],
 )
 def test_not_a_deferral_signal(tools: Any) -> None:
     assert request_already_defers_tools(tools) is False
+
+
+# ---------------------------------------------------------------------------
+# Deferral is not an Anthropic-only feature. A survey of shipped harnesses
+# found their own tool search in Codex, GitHub Copilot CLI, VS Code Copilot,
+# Kiro and Codebuff, each with a different wire spelling. Matching only
+# Anthropic's versioned ``tool_search_tool_*`` prefix stood down for none of
+# them, so Headroom deferred on top of a client that was already deferring --
+# which suppresses the client's mechanism and inlines the very catalog we were
+# keeping out.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        # Codex: codex-rs/tools/src/tool_spec.rs. A union variant carrying no
+        # ``name`` field at all, so a name-only scan can never see it.
+        pytest.param({"type": "tool_search"}, id="codex-responses-bare-type"),
+        # VS Code Copilot: ToolName.tool_search; Kiro CLI uses the same name.
+        pytest.param({"name": "tool_search"}, id="vscode-copilot-kiro-name"),
+        # GitHub Copilot CLI: the exact string ``tool_search_tool``, which does
+        # NOT start with ``tool_search_tool_`` -- the off-by-one that let the
+        # prefix test miss a shipped harness.
+        pytest.param({"name": "tool_search_tool"}, id="copilot-cli-exact"),
+        pytest.param({"name": "tool_search_tool_regex"}, id="copilot-cli-regex"),
+        # Codebuff delegates to an external catalog under its own name.
+        pytest.param({"name": "composio_search_tools"}, id="codebuff"),
+    ],
+)
+def test_every_known_meta_tool_spelling_means_the_client_defers(marker: dict[str, Any]) -> None:
+    assert request_already_defers_tools([marker, *_mcp(3)]) is True
+
+
+def test_defer_loading_alone_means_the_client_defers() -> None:
+    """Shape-independent: the client marking its own catalog deferred is enough.
+
+    Worth matching on its own because it needs no agreement about what the
+    meta-tool is called, so it still holds for a harness this survey missed.
+    """
+    tools = [{"name": "mcp__github__list_issues", "defer_loading": True}, *_mcp(3)]
+
+    assert request_already_defers_tools(tools) is True
+
+
+def test_defer_loading_false_is_not_a_signal() -> None:
+    """Present-and-false is a client that considered deferral and declined."""
+    assert request_already_defers_tools([{"name": "read", "defer_loading": False}]) is False
+
+
+# --- namespace nesting -----------------------------------------------------
+
+
+def _namespace(name: str, *tools: dict[str, Any]) -> dict[str, Any]:
+    """A Responses namespace group, the shape Codex ships MCP servers in."""
+    return {"type": "namespace", "name": name, "tools": list(tools)}
+
+
+def test_a_meta_tool_nested_in_a_namespace_is_found() -> None:
+    """The wrapper is visible to a top-level scan; its contents are not."""
+    tools = [_namespace("functions", {"type": "function", "name": "tool_search_tool"})]
+
+    assert request_already_defers_tools(tools) is True
+
+
+def test_defer_loading_nested_in_a_namespace_is_found() -> None:
+    tools = [_namespace("github", {"type": "function", "name": "x", "defer_loading": True})]
+
+    assert request_already_defers_tools(tools) is True
+
+
+def test_a_plain_namespace_is_not_a_deferral_signal() -> None:
+    """Grouping tools is not deferring them."""
+    tools = [_namespace("github", {"type": "function", "name": "list_issues"})]
+
+    assert request_already_defers_tools(tools) is False
+
+
+def test_iter_tool_entries_yields_the_wrapper_and_its_members() -> None:
+    nested = {"type": "function", "name": "inner"}
+    group = _namespace("ns", nested)
+
+    names = [t.get("name") for t in iter_tool_entries([{"name": "top"}, group])]
+
+    assert names == ["top", "ns", "inner"]
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        pytest.param(None, id="not-a-list"),
+        pytest.param([{"type": "namespace"}], id="namespace-without-tools"),
+        pytest.param([{"type": "namespace", "tools": "nope"}], id="tools-not-a-list"),
+        pytest.param([{"type": "namespace", "tools": [7, "x"]}], id="non-dict-members"),
+    ],
+)
+def test_iter_tool_entries_tolerates_malformed_input(tools: Any) -> None:
+    """A malformed namespace must not raise on the request path."""
+    assert all(isinstance(t, dict) for t in iter_tool_entries(tools))
+
+
+def test_nesting_does_not_recurse_past_one_level() -> None:
+    """One level is what the API defines; deeper input is not trusted."""
+    deep = _namespace("outer", _namespace("inner", {"name": "buried"}))
+
+    assert "buried" not in [t.get("name") for t in iter_tool_entries([deep])]
 
 
 def test_extra_names_can_be_configured(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -325,6 +437,41 @@ def test_openai_still_defers_for_an_eager_client() -> None:
 
     assert out is not tools
     assert len(_deferred(out)) == 14
+
+
+def test_openai_counts_namespace_members_toward_the_threshold() -> None:
+    """A big catalog grouped under one namespace is still a big catalog.
+
+    Counting only top-level entries reads a 20-tool MCP server as a single
+    tool and skips the request, which is precisely the request with the most
+    schema to save.
+    """
+    top_level = [_fn(f"jira_{i}") for i in range(4)]
+    tools = [
+        *top_level,
+        {"type": "namespace", "name": "slack", "tools": [_fn(f"slack_{i}") for i in range(20)]},
+    ]
+
+    assert len(tools) < _TOOL_SEARCH_MIN_TOOLS  # a top-level count would bail here
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5")
+
+    # The namespace itself stays untouched; the top-level tools it made us
+    # look at in the first place are what get deferred.
+    assert [t["name"] for t in _deferred(out)] == [t["name"] for t in top_level]
+
+
+def test_openai_leaves_namespace_groups_resident() -> None:
+    """We do not guess a wire shape for deferring inside a namespace.
+
+    Marking nested members ``defer_loading`` is unverified against the API, and
+    an unknown field in the wrong place is a 400. Counting them is safe;
+    rewriting them is not, so the group is forwarded untouched.
+    """
+    group = {"type": "namespace", "name": "slack", "tools": [_fn(f"slack_{i}") for i in range(20)]}
+    out = inject_tool_search_deferral_openai([_fn("bash"), group], "gpt-5.5")
+
+    assert group in out
+    assert _deferred(out) == []
 
 
 def test_openai_toolsearch_name_alone_does_not_stand_us_down() -> None:
