@@ -20,6 +20,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -1723,6 +1724,28 @@ def _headroom_log_dir() -> Path:
 _PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
 
 
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log file is only readable by its owner.
+
+    ``logging`` opens the stream itself — once at construction and again for
+    every rollover — so the process umask decides the mode and there is no
+    hook to pass one. Pre-creating the file with an explicit 0600 closes the
+    window before the handler's own ``open()`` runs (which does not change the
+    mode of a file that already exists), and the chmod covers a log left at
+    0644 by an earlier run.
+    """
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        try:
+            os.close(os.open(self.baseFilename, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600))
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            # Non-fatal: an unwritable path fails on the real open() below,
+            # where the caller already handles OSError.
+            pass
+        return super()._open()
+
+
 def _setup_file_logging(
     port: int | None = None,
     *,
@@ -1737,8 +1760,15 @@ def _setup_file_logging(
     The file is keyed by *port* so concurrent instances rotate separate logs.
     Multi-worker callers also pass *process_id* so same-port workers cannot
     race during rollover. When *port* is omitted the legacy shared name is used.
+
+    When ``HEADROOM_LOG_PAYLOAD_PREVIEW`` is on, the log holds verbatim
+    tool-result content, so the file is created 0600 instead of at the umask.
     """
-    from logging.handlers import RotatingFileHandler
+    from headroom.cache.compression_store import _payload_preview_enabled
+
+    handler_cls = (
+        _OwnerOnlyRotatingFileHandler if _payload_preview_enabled() else RotatingFileHandler
+    )
 
     try:
         log_dir = _headroom_log_dir()
@@ -1763,7 +1793,7 @@ def _setup_file_logging(
         ]
         if any(Path(h.baseFilename) == log_path for h in existing):
             return
-        handler = RotatingFileHandler(
+        handler = handler_cls(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,

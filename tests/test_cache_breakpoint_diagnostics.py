@@ -9,6 +9,11 @@ Covers the three pieces added for the uncached-tail investigation:
 from __future__ import annotations
 
 import logging
+import stat
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
 
 from headroom.cache.compression_store import _payload_for_retrieval_log
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
@@ -125,10 +130,26 @@ def test_payload_preview_disabled_omits_content(monkeypatch) -> None:
     assert event["payload_truncated"] is True
 
 
-def test_payload_preview_enabled_by_default(monkeypatch) -> None:
+def test_payload_preview_disabled_by_default(monkeypatch) -> None:
+    """Unset means off: the log gets byte counts, never the content."""
     monkeypatch.delenv("HEADROOM_LOG_PAYLOAD_PREVIEW", raising=False)
     event = _payload_for_retrieval_log("hello world")
-    assert event["payload_preview"] == "hello world"
+    assert event["payload_preview"] == ""
+    assert event["payload_preview_chars"] == 0
+    assert event["payload_chars"] == len("hello world")
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_payload_preview_opt_in_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", value)
+    assert _payload_for_retrieval_log("hello world")["payload_preview"] == "hello world"
+
+
+@pytest.mark.parametrize("value", ["", "0", "off", "no", "maybe", "  "])
+def test_payload_preview_stays_off_for_anything_else(monkeypatch, value: str) -> None:
+    """Only an explicit opt-in turns previews on — a typo must not."""
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", value)
+    assert _payload_for_retrieval_log("hello world")["payload_preview"] == ""
 
 
 def test_append_context_skips_breakpointed_text_block() -> None:
@@ -178,3 +199,76 @@ def test_count_cache_breakpoints_tolerates_malformed_shapes() -> None:
     empty = count_cache_breakpoints(None, None, None)
     assert empty["total"] == 0
     assert empty["message_count"] == 0
+
+
+# --- the runtime log file itself -------------------------------------------
+#
+# _payload_for_retrieval_log decides what goes into the record;
+# _setup_file_logging decides who can read the file it lands in. Both halves
+# of the default-off guarantee are checked against a real log on disk.
+
+
+@contextmanager
+def _proxy_log(tmp_path, monkeypatch, port: int):
+    """Point the workspace at *tmp_path*, install the real proxy log handler."""
+    from headroom.proxy.helpers import _PROXY_LOG_HANDLER_NAME, _setup_file_logging
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    headroom_logger = logging.getLogger("headroom")
+    before = list(headroom_logger.handlers)
+    propagate = headroom_logger.propagate
+    try:
+        _setup_file_logging(port)
+        [handler] = [h for h in headroom_logger.handlers if h.name == _PROXY_LOG_HANDLER_NAME]
+        yield Path(handler.baseFilename)
+    finally:
+        for handler in list(headroom_logger.handlers):
+            if handler not in before:
+                headroom_logger.removeHandler(handler)
+                handler.close()
+        headroom_logger.propagate = propagate
+
+
+def test_runtime_log_holds_no_payload_text_at_default_settings(tmp_path, monkeypatch) -> None:
+    """A retrieval on default settings leaves byte counts in the log, not content."""
+    from headroom.cache.compression_store import CompressionStore
+
+    monkeypatch.delenv("HEADROOM_LOG_PAYLOAD_PREVIEW", raising=False)
+    secret = "BEGIN-CUSTOMER-DATA ssn=123-45-6789 def sekrit(): pass END-CUSTOMER-DATA"
+
+    with _proxy_log(tmp_path, monkeypatch, 18801) as log_path:
+        store = CompressionStore(enable_feedback=False)
+        assert store.retrieve(store.store(original=secret, compressed="[compressed]")) is not None
+        logging.getLogger("headroom").handlers[-1].flush()
+        text = log_path.read_text(encoding="utf-8")
+
+    assert "event=headroom_retrieve" in text, "the retrieval was not logged at all"
+    assert secret not in text
+    assert "123-45-6789" not in text
+    assert f'"payload_chars":{len(secret)}' in text
+    assert '"payload_preview":""' in text
+
+
+def test_runtime_log_is_owner_only_when_preview_enabled(tmp_path, monkeypatch) -> None:
+    """Opting in to previews hardens the log the previews land in."""
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
+    with _proxy_log(tmp_path, monkeypatch, 18802) as log_path:
+        assert log_path.exists()
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+
+def test_runtime_log_hardening_survives_a_pre_existing_world_readable_log(
+    tmp_path, monkeypatch
+) -> None:
+    """O_CREAT's mode does not apply to an existing file; the chmod must."""
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
+    from headroom import paths as _paths
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    stale = _paths.proxy_log_path(18803)
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("from an older, unhardened run\n", encoding="utf-8")
+    stale.chmod(0o644)
+
+    with _proxy_log(tmp_path, monkeypatch, 18803) as log_path:
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
