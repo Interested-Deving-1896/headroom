@@ -22,9 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # token to its own scan.
 FLAG = "trust_remote" + "_code"
 
-# Matches the kwarg form (``flag=True``) and the mapping form (``"flag": True``),
-# capturing whatever it is set to.
-ASSIGNMENT = re.compile(re.escape(FLAG) + r"\s*[=:]\s*([A-Za-z_][\w.]*)")
+# Matches the kwarg form (``flag=True``), the mapping form (``"flag": True``)
+# and the subscript form (``kwargs["flag"] = True``), capturing whatever it is
+# set to. The optional quote and bracket matter: without them the mapping form
+# slips through, and ``from_pretrained(**{"flag": True})`` is exactly how this
+# would come back.
+ASSIGNMENT = re.compile(re.escape(FLAG) + r"[\"']?\s*\]?\s*[=:]\s*([A-Za-z_][\w.]*)")
 
 
 def _tracked_files() -> list[Path]:
