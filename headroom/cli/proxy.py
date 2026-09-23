@@ -1297,9 +1297,34 @@ def proxy(
     # (TTL observations, the update-check cache), and uvicorn worker processes
     # only see the mode if it is in the environment they inherit.
     if is_stateless:
+        from headroom.cache.compression_store import ccr_backend_writes_local_disk
+
         os.environ["HEADROOM_STATELESS"] = "true"
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
-        os.environ["HEADROOM_CCR_BACKEND"] = "memory"
+        # Only the local-disk CCR backends are forced to memory. An operator
+        # who configured an external one (e.g. HEADROOM_CCR_BACKEND=redis)
+        # already writes nothing to this machine's filesystem AND keeps
+        # retrieval shared across workers and restarts, which is exactly what a
+        # regulated multi-worker deployment wants; silently downgrading that to
+        # a per-worker dict would break retrieval to fix nothing.
+        if ccr_backend_writes_local_disk(os.environ.get("HEADROOM_CCR_BACKEND")):
+            os.environ["HEADROOM_CCR_BACKEND"] = "memory"
+
+        # An in-process CCR store is not shared between uvicorn workers, so a
+        # retrieval served by a different worker than the compression misses.
+        # At --workers 4 that is roughly three retrievals in four. Say it here
+        # rather than let operators debug it through a TTL-shaped miss message.
+        if workers > 1 and os.environ.get("HEADROOM_CCR_BACKEND") == "memory":
+            click.echo(
+                f"  WARNING: --stateless with --workers {workers} keeps the CCR "
+                "retrieval store in each worker's memory.\n"
+                "           A retrieval handled by a different worker than the "
+                "compression will miss.\n"
+                "           Use an external CCR backend (HEADROOM_CCR_BACKEND=redis, "
+                "no local-disk writes)\n"
+                "           or run --workers 1.",
+                err=True,
+            )
 
     # License key for managed/enterprise deployments (optional)
     license_key = os.environ.get("HEADROOM_LICENSE_KEY")
@@ -1553,8 +1578,25 @@ Memory (Multi-Provider):
     # Stateless mode warning
     stateless_line = ""
     if is_stateless:
+        # Be accurate about the scope. "No filesystem writes" was never true:
+        # the runtime log, the beacon lock, the subscription state and the
+        # model caches are all still written. What the flag actually
+        # guarantees is that no request content is persisted.
+        _ccr_backend = os.environ.get("HEADROOM_CCR_BACKEND") or "sqlite"
+        _ccr_note = (
+            "in-process only"
+            if _ccr_backend == "memory"
+            else f"external backend {_ccr_backend!r}, no local-disk writes"
+        )
         stateless_line = (
-            "  Stateless:    YES (no filesystem writes — memory, logs, TOIN disabled)\n"
+            "  Stateless:    YES (no request content on disk — memory, TOIN, "
+            "savings,\n"
+            "                request logs off; CCR retrieval store "
+            f"{_ccr_note})\n"
+            "                Still written: the runtime log at "
+            f"{_paths.proxy_log_path(port)},\n"
+            "                the beacon lock, subscription state, and model "
+            "caches.\n"
         )
 
     from headroom.telemetry.beacon import is_telemetry_enabled

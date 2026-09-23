@@ -26,6 +26,17 @@ class CompressionStoreBackend(Protocol):
     - Thread-safety is implementation's responsibility
     - TTL handling can be delegated to backend or handled by CompressionStore
 
+    Optional class attributes (read with ``getattr(backend, name, default)``,
+    deliberately NOT part of the protocol so third-party backends stay valid
+    under ``isinstance``):
+
+    - ``is_process_local: bool`` (default False) -- True when entries live only
+      in this process: not shared with other workers, gone on restart. Drives
+      the retrieval-miss diagnostics, so a miss is not blamed on TTL when the
+      real cause is that the entry was stored by a different worker.
+    - ``close() -> None`` -- release the backend's handles without destroying
+      stored entries. Called when stateless mode swaps a backend out.
+
     Example implementation:
         class MyBackend:
             def get(self, hash_key: str) -> CompressionEntry | None:

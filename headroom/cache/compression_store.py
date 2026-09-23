@@ -93,18 +93,52 @@ def _get_env_default_ttl_seconds() -> int:
     return ttl_seconds
 
 
+PROCESS_LOCAL_STORE_DETAIL = (
+    " — this worker's CCR store is in-process only, so entries stored by a "
+    "different worker or before a restart are not visible here"
+)
+
+
+def _active_store_is_process_local() -> bool:
+    """True when the store serving this request keeps entries in-process only.
+
+    Reads the already-built store (request-scoped first, then the global
+    singleton) rather than calling ``get_compression_store()``, so a
+    diagnostics call can never be the thing that constructs the singleton.
+    """
+    store = _request_ccr_store.get() or _compression_store
+    if store is None:
+        return False
+    return store.backend_is_process_local
+
+
 def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
-    """Return an operator-facing miss reason for CCR retrieval failures."""
+    """Return an operator-facing miss reason for CCR retrieval failures.
+
+    A *missing* entry is only a TTL story when the store could have held it in
+    the first place. With an in-process-only store — which is what
+    ``HEADROOM_CCR_BACKEND=memory`` and ``--stateless`` give you — a retrieval
+    that lands on a different worker than the compression misses no matter what
+    the TTL is, and at ``--workers 4`` that is most retrievals. Say so, instead
+    of pointing every operator at a TTL that is not the cause.
+    """
     default_ttl = status.get("default_ttl_seconds", DEFAULT_CCR_TTL_SECONDS)
     ttl_seconds = status.get("ttl_seconds", default_ttl)
 
     if status.get("status") == "expired":
+        # Found but stale: the TTL really is the reason. No store note.
         age_seconds = status.get("age_seconds")
         if isinstance(age_seconds, (int, float)):
             return f"Entry expired (CCR TTL: {ttl_seconds} seconds; age: {age_seconds:.0f} seconds)"
         return f"Entry expired (CCR TTL: {ttl_seconds} seconds)"
 
-    return f"Entry not found (CCR TTL: {default_ttl} seconds)"
+    detail = f"Entry not found (CCR TTL: {default_ttl} seconds)"
+    process_local = status.get("store_is_process_local")
+    if process_local is None:
+        process_local = _active_store_is_process_local()
+    if process_local:
+        detail += PROCESS_LOCAL_STORE_DETAIL
+    return detail
 
 
 def _redact_retrieval_log_payload(payload: str) -> str:
@@ -114,6 +148,18 @@ def _redact_retrieval_log_payload(payload: str) -> str:
 
 
 def _payload_preview_enabled() -> bool:
+    """Whether the retrieval log may carry a slice of the retrieved payload.
+
+    Off under stateless mode regardless of the env var. The retrieval log goes
+    to the always-on runtime log file under the workspace, so leaving previews
+    on would put tool-result content on disk through the back door — the exact
+    thing a stateless deployment selected the flag to avoid. (The non-stateless
+    default is a separate question, tracked as its own item.)
+    """
+    from ..paths import process_is_stateless
+
+    if process_is_stateless():
+        return False
     raw = os.environ.get(PAYLOAD_PREVIEW_ENV)
     if raw is None:
         return True
@@ -148,7 +194,10 @@ CCR_MISS_MESSAGE = (
     "references a file Read, re-read that file (the path is in the "
     "marker; disk is the source of truth). If it was command output, "
     "re-run the command. Entries expire after the store TTL "
-    "(default 30 minutes; configurable via HEADROOM_CCR_TTL_SECONDS)."
+    "(default 30 minutes; configurable via HEADROOM_CCR_TTL_SECONDS), and "
+    "when the CCR store is in-process only (HEADROOM_CCR_BACKEND=memory, "
+    "which --stateless forces) they are also invisible to other workers and "
+    "lost on restart, so a miss need not mean the TTL elapsed."
 )
 
 
@@ -271,6 +320,54 @@ class CompressionStore:
     def default_ttl_seconds(self) -> int:
         """Default TTL applied to new entries when callers do not override it."""
         return self._default_ttl
+
+    @property
+    def backend_is_process_local(self) -> bool:
+        """True when this store's entries live only in this process."""
+        with self._lock:
+            return bool(getattr(self._backend, "is_process_local", False))
+
+    def use_process_local_backend(self) -> bool:
+        """Swap this store's backend for a fresh in-process one.
+
+        This is how stateless mode stops the CCR store writing tool-result
+        originals to disk. Two things it deliberately does NOT do:
+
+        - It does not ``clear()``. The on-disk backend is left exactly as it
+          was: ``ccr_store.db`` is shared with the other worker processes and
+          survives restarts by design, so deleting its rows would destroy
+          entries live workers are still serving.
+        - It does not rebuild the store object. Callers that already captured
+          this store (``CompressionFeedback._store``, request-scoped
+          stores, anything holding the singleton) keep their reference and
+          stop writing to disk with it. Dropping the module global alone would
+          leave those writers happily persisting originals.
+
+        Entries already loaded from the shared store are NOT carried over: a
+        stateless process should not go on serving — or holding in RAM —
+        originals it was told to stop touching.
+
+        Returns True if a backend was actually swapped out.
+        """
+        from .backends import InMemoryBackend
+
+        with self._lock:
+            previous = self._backend
+            if getattr(previous, "is_process_local", False):
+                return False
+            self._backend = InMemoryBackend()
+            self._retrieval_events.clear()
+            self._pending_feedback_events.clear()
+            self._eviction_heap.clear()
+            self._stale_heap_entries = 0
+
+        close = getattr(previous, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - never fail startup over a close
+                logger.debug("Closing previous CCR backend failed", exc_info=True)
+        return True
 
     def store(
         self,
@@ -604,12 +701,16 @@ class CompressionStore:
         """Return availability and TTL metadata for a stored entry."""
         now = time.time()
         with self._lock:
+            process_local = bool(getattr(self._backend, "is_process_local", False))
             entry = self._backend.get(hash_key)
             if entry is None:
                 return {
                     "hash": hash_key,
                     "status": "missing",
                     "default_ttl_seconds": self._default_ttl,
+                    # Lets format_retrieval_miss_detail explain a cross-worker
+                    # miss instead of blaming the TTL.
+                    "store_is_process_local": process_local,
                 }
 
             age_seconds = now - entry.created_at
@@ -1003,6 +1104,23 @@ def clear_request_compression_store() -> None:
     _request_ccr_store.set(None)
 
 
+# HEADROOM_CCR_BACKEND values that put entries on the local filesystem.
+# "" is the unset default, which resolves to sqlite.
+_LOCAL_DISK_CCR_BACKENDS = frozenset({"", "sqlite"})
+
+
+def ccr_backend_writes_local_disk(backend_type: str | None) -> bool:
+    """True when this ``HEADROOM_CCR_BACKEND`` value stores entries on local disk.
+
+    Only the local-disk backends are what ``--stateless`` is about. The
+    entry-point adapters (e.g. a ``redis`` backend) keep nothing on the
+    machine's filesystem, and they are the only way to share retrieval across
+    workers and restarts — precisely what a multi-worker stateless deployment
+    needs — so stateless mode keeps them.
+    """
+    return (backend_type or "").strip().lower() in _LOCAL_DISK_CCR_BACKENDS
+
+
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. HEADROOM_CCR_BACKEND=redis).
 
@@ -1013,18 +1131,30 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
 
-    Stateless mode wins over every backend choice. The CLI already exports
-    HEADROOM_CCR_BACKEND=memory, but embedders reach this through
-    ``ProxyConfig(stateless=True)`` without touching the environment, so we
-    fail closed here too: a store that never writes can never leak, and
-    entries stay in-process for the session-scale TTL either way.
+    Stateless mode overrides the *local-disk* backends only, and does so here
+    as well as in the CLI because embedders reach this through
+    ``ProxyConfig(stateless=True)`` without touching the environment. An
+    external backend is left alone: ``--stateless`` is a promise about this
+    machine's filesystem, not a reason to silently downgrade an operator's
+    shared store to a per-worker dict.
     """
     from ..paths import process_is_stateless
 
-    if process_is_stateless():
-        return None
-
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
+    stateless = process_is_stateless()
+
+    if stateless and ccr_backend_writes_local_disk(backend_type):
+        logger.info(
+            "Stateless mode: CCR retrieval store is in-process only "
+            "(HEADROOM_CCR_BACKEND=%s would write tool-result originals to "
+            "%s). Retrieval will not survive a restart and is not shared "
+            "across workers — set an external backend (e.g. "
+            "HEADROOM_CCR_BACKEND=redis) to keep it shared without writing to "
+            "local disk.",
+            backend_type or "sqlite",
+            "workspace_dir()/ccr_store.db",
+        )
+        return None
     if backend_type == "memory":
         return None
     if not backend_type or backend_type == "sqlite":
@@ -1058,6 +1188,13 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
             "tenant_prefix": os.environ.get("HEADROOM_CCR_TENANT_PREFIX", ""),
         }
         backend: CompressionStoreBackend = fn(**kwargs)
+        if stateless:
+            logger.info(
+                "Stateless mode: keeping external CCR backend %r. It writes "
+                "nothing to local disk and keeps retrieval shared across "
+                "workers; --stateless does not downgrade it.",
+                backend_type,
+            )
         return backend
     except Exception as e:
         logger.warning("Failed to load CCR backend %s: %s", backend_type, e)
@@ -1106,8 +1243,46 @@ def get_compression_store(
     return _compression_store
 
 
+def make_compression_store_stateless() -> bool:
+    """Stop the live CCR store writing to disk, without destroying what is there.
+
+    Called when a stateless proxy is built in a process that may already hold a
+    store backed by ``ccr_store.db``. It swaps that store's backend in place
+    (see ``CompressionStore.use_process_local_backend``) rather than calling
+    ``reset_compression_store()``, which would ``DELETE FROM ccr_entries`` —
+    a shared file that other worker processes are still serving from and that
+    exists precisely to outlive this process.
+
+    Swapping in place is also what actually closes the hole: components that
+    captured the store object earlier (notably
+    ``CompressionFeedback.store``) keep writing through their own
+    reference, so clearing the module global alone would leave verbatim
+    originals landing on disk after the stateless proxy is up.
+
+    Returns True if an on-disk backend was swapped out.
+    """
+    with _store_lock:
+        store = _compression_store
+
+    swapped = store.use_process_local_backend() if store is not None else False
+
+    # A request-scoped store (SaaS tenant store) set up before the swap gets
+    # the same treatment; normally there is none at proxy-construction time.
+    request_store = _request_ccr_store.get()
+    if request_store is not None and request_store is not store:
+        swapped = request_store.use_process_local_backend() or swapped
+
+    return swapped
+
+
 def reset_compression_store() -> None:
-    """Reset the global compression store. Mainly for testing."""
+    """Reset the global compression store. Mainly for testing.
+
+    WARNING: this ``clear()``s the store first, which on the SQLite backend is
+    ``DELETE FROM ccr_entries`` against a database shared with other worker
+    processes. Do not call it to "drop the singleton" in a live proxy — use
+    ``make_compression_store_stateless()`` for that.
+    """
     global _compression_store
 
     with _store_lock:

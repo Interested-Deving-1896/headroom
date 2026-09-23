@@ -32,6 +32,11 @@ class InMemoryBackend:
         entry = backend.get("abc123")
     """
 
+    # Entries live in this process only: nothing on local disk, nothing shared
+    # with other workers, nothing surviving a restart. Read by stateless mode
+    # and by the retrieval-miss diagnostics.
+    is_process_local = True
+
     def __init__(self) -> None:
         """Initialize the in-memory backend."""
         self._store: dict[str, CompressionEntry] = {}
