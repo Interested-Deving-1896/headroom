@@ -211,12 +211,17 @@ def _load_tokenizer(tokenizer_name: str):
     Returns:
         Loaded tokenizer, or None if unavailable.
     """
-    if _resolve_allowed_repo(tokenizer_name) is None:
+    repo = _resolve_allowed_repo(tokenizer_name)
+    if repo is None:
         logger.warning(
             f"Refusing to load unallowlisted tokenizer {tokenizer_name!r}; using "
             f"estimation (add it to {_ALLOWLIST_ENV} if this repository is trusted)"
         )
         return None
+    # Load the allowlist's own spelling, never the argument: matching is
+    # case-insensitive, so the string that reaches the Hub must be the one we
+    # vetted, not a variant the caller chose.
+    tokenizer_name = repo
 
     from transformers import AutoTokenizer
 

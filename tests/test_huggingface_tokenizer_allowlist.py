@@ -122,6 +122,20 @@ def test_loader_refuses_unallowlisted_repo_without_touching_the_hub(
     assert _load_tokenizer("meta-llama/Meta-Llama-3-8B-but-not-really") is None
 
 
+def test_loader_fetches_the_allowlists_own_spelling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case-insensitive matching must not let the caller pick the fetched string."""
+    names: list[str] = []
+
+    def fake_from_pretrained(name: str, **kwargs: Any):
+        names.append(name)
+        return _FakeTokenizer()
+
+    _install_fake_transformers(monkeypatch, fake_from_pretrained)
+
+    assert _load_tokenizer("  META-LLAMA/llama-3.1-8b  ") is not None
+    assert names == ["meta-llama/Llama-3.1-8B"]
+
+
 # ---------------------------------------------------------------------------
 # trust_remote_code is off on every path
 # ---------------------------------------------------------------------------
