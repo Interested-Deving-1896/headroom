@@ -158,6 +158,38 @@ class KompressModelNotCached(RuntimeError):
     """
 
 
+def _hf_artifact(model_id: str, filename: str, *, allow_network: bool) -> str:
+    """``hf_hub_download_local_first`` with the air-gap refusal translated.
+
+    ``OfflineEgressBlocked`` is a ``BaseException`` so that no ``except
+    Exception:`` can silently degrade an air-gap refusal into "that feature
+    stopped working". At THIS boundary that degradation is the correct
+    behaviour and is written down rather than inherited: a model download is
+    not data leaving the box, every caller below already handles
+    "the model is not available locally", and failing a user's request because
+    an optional compressor could not fetch public weights would punish the
+    request for a decision the operator made about the host.
+
+    So the refusal is logged with the switch named and re-raised as
+    :class:`KompressModelNotCached`, which is exactly what it means: under
+    ``HEADROOM_OFFLINE`` the only artifacts that will ever be available are the
+    cached ones. The original refusal is chained, so it is still in the
+    traceback.
+    """
+    try:
+        return hf_hub_download_local_first(model_id, filename, allow_network=allow_network)
+    except OfflineEgressBlocked as blocked:
+        logger.warning(
+            "Kompress: %r for %s is not cached and %s forbids fetching it (%s). "
+            "Compression falls back to the non-ML path.",
+            filename,
+            model_id,
+            OFFLINE_ENV,
+            blocked,
+        )
+        raise KompressModelNotCached(model_id) from blocked
+
+
 # Model cache: model_id -> (model, tokenizer, backend)
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
@@ -667,9 +699,7 @@ def _create_onnx_session(
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = hf_hub_download_local_first(
-                model_id, filename, allow_network=allow_download
-            )
+            onnx_path = _hf_artifact(model_id, filename, allow_network=allow_download)
         except Exception as exc:
             last_err = exc
             cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)
@@ -854,7 +884,7 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
     HuggingFace Hub's own cache of confirmed-404 lookups.
     """
     try:
-        ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
+        ckpt_path = _hf_artifact(model_id, "merged.pt", allow_network=allow_download)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             if not hf_entry_known_absent(model_id, "merged.pt"):
@@ -871,9 +901,7 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
             # merged.pt genuinely does not exist in this repo (confirmed by a
             # real network lookup, not just a cache miss) - fall back to the
             # plain format instead of treating it as a download failure.
-            weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
-            )
+            weights_path = _hf_artifact(model_id, "model.safetensors", allow_network=allow_download)
             _load_plain_state_dict(model, weights_path, model_id)
             return
         raise

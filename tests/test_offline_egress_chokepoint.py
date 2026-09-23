@@ -584,6 +584,72 @@ class TestBackgroundDownloadThreads:
         assert "HEADROOM_OFFLINE" in caplog.text
 
 
+class TestModelLoadersDegradeExplicitly:
+    """Where a refusal SHOULD become a degradation, it is written down.
+
+    ``OfflineEgressBlocked`` escaping ``except Exception`` is the point — but
+    fetching public model weights is not data leaving the box, and failing a
+    user's request because an optional compressor could not reach the Hub would
+    punish the request for a decision the operator made about the host. Each
+    optional model loader therefore translates the refusal into its own
+    "model unavailable" error, explicitly, naming the switch in the log. That
+    keeps the pre-existing degradation for an air-gapped box with a cold cache,
+    and keeps the translation reviewable instead of inherited.
+    """
+
+    @staticmethod
+    def _cold_hub(monkeypatch: pytest.MonkeyPatch) -> None:
+        import huggingface_hub
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        def fake_download(repo_id, filename, *, revision=None, local_files_only=False):
+            raise LocalEntryNotFoundError("cold cache")
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    def test_kompress_reports_not_cached_rather_than_a_bare_refusal(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.transforms.kompress_compressor import (
+            KompressModelNotCached,
+            _hf_artifact,
+        )
+
+        self._cold_hub(monkeypatch)
+        with pytest.raises(KompressModelNotCached) as excinfo:
+            _hf_artifact("acme/model", "model.onnx", allow_network=True)
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+
+    def test_the_image_router_degrades_the_same_way_it_always_did(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.image.onnx_router import _hf_artifact
+
+        self._cold_hub(monkeypatch)
+        with pytest.raises(RuntimeError) as excinfo:
+            _hf_artifact("acme/router", "model_quantized.onnx")
+        assert not isinstance(excinfo.value, OfflineEgressBlocked)
+        assert "HEADROOM_OFFLINE" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+
+    def test_a_warm_cache_is_unaffected(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The translation must not fire when nothing was refused."""
+        import huggingface_hub
+
+        from headroom.transforms.kompress_compressor import _hf_artifact
+
+        monkeypatch.setattr(
+            huggingface_hub,
+            "hf_hub_download",
+            lambda *a, **k: "/cache/acme/model.onnx",
+        )
+        assert _hf_artifact("acme/model", "model.onnx", allow_network=True) == (
+            "/cache/acme/model.onnx"
+        )
+
+
 class TestBroadHandlerSweep:
     """``except Exception`` can no longer swallow the refusal — the type sees
     to that. ``except BaseException`` and bare ``except:`` still can, so they

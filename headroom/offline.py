@@ -10,10 +10,11 @@ is the one switch that turns them all off together and fails closed.
 is about to open an outbound connection calls it and gets a loud
 :class:`OfflineEgressBlocked` instead of a socket. Prefer it over a bare
 ``if is_offline(): return`` at any call site that actually dials out — the
-meta-test in ``tests/test_offline_egress_chokepoint.py`` enumerates the HTTP
-clients in the tree and requires each one to be behind the guard or carry a
-written allowlist reason, so the guard is what keeps a newly-added egress path
-from silently escaping the air-gap.
+meta-test in ``tests/test_offline_egress_chokepoint.py`` enumerates the
+outbound clients in ``headroom/`` and ``crates/`` and requires each **site** to
+have a guard that dominates it or to be counted in an allowlist with a written
+reason, so the guard is what keeps a newly-added egress path from silently
+escaping the air-gap.
 
 Kept at the top level (depends only on the stdlib) so any layer — telemetry,
 proxy, model code — can import it without creating a package cycle.
@@ -94,6 +95,14 @@ class OfflineEgressBlocked(BaseException):
       under a running proxy; the ordinary contradictory-configuration case is
       caught at startup by ``headroom/proxy/server.py``'s offline preflight,
       which exits 78 with an explanation instead.
+    * Where a refusal SHOULD become a degradation, the boundary that owns the
+      degradation says so explicitly. Fetching public model weights is not data
+      leaving the box, so each optional model loader catches this and re-raises
+      its own "model unavailable" error with the switch named — see
+      ``kompress_compressor._hf_artifact``, ``image/onnx_router._hf_artifact``
+      and the ONNX embedder in ``memory/adapters/embedders.py``. Translating is
+      fine; inheriting a translation from whichever ``except Exception`` happens
+      to be in the stack is what this type prevents.
     """
 
     def __init__(self, purpose: str, destination: str | None = None) -> None:
