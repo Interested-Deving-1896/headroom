@@ -268,6 +268,8 @@ Verify with `curl -s localhost:8787/stats | jq .otel`.
 
 **Multi-tenant labels:** `register_otel_metric_attribute_provider()` adds request-scoped attributes (tenant, team, cost centre) to every OTel datapoint. Max 16 attributes, 256 chars each.
 
-**Air-gapped deployments:** `HEADROOM_OFFLINE=1` disables all outbound traffic — the anonymous usage beacon (which is **on by default**), the update check, and model downloads.
+**Air-gapped deployments:** `HEADROOM_OFFLINE=1` disables all outbound traffic — the anonymous usage beacon (which is **on by default**), the update check, model downloads, the remote Kompress endpoint, and **OTLP metric export**.
+
+OTLP export is refused loudly: with `HEADROOM_OFFLINE=1` set, `HEADROOM_OTEL_METRICS_ENABLED=1` plus the default `otlp_http` exporter raises `OfflineEgressBlocked` at startup rather than quietly dropping metrics. There is no exemption for a collector that looks local — an in-cluster address is not reliably distinguishable from an internet one. For metrics under an air-gap, either scrape `localhost:8787/metrics` or set `HEADROOM_OTEL_METRICS_EXPORTER=console`, both of which stay on-box.
 
 ---
