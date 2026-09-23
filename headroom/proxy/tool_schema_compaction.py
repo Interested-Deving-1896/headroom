@@ -34,10 +34,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Keys that are JSON Schema annotations, not constraints.
 # Removing them does not change the set of valid inputs.
@@ -390,6 +393,22 @@ def compact_tool_descriptions(
 
     tools = payload.get("tools")
     if not isinstance(tools, list) or not tools:
+        return payload, False, 0, 0
+
+    # A cache_control marker on any tool means "cache everything up to and
+    # including this one". Truncating a description inside that span changes the
+    # bytes the provider hashed, so the whole tools prefix -- and every message
+    # after it -- re-bills as cache creation. The saving is a few hundred bytes;
+    # the bust is the entire conversation. Mirrors the same guard on
+    # ``_sort_tools_deterministically`` (handlers/anthropic.py) and
+    # ``any_tool_has_cache_control`` in the Rust live zone.
+    marked = sum(1 for t in tools if isinstance(t, dict) and t.get("cache_control"))
+    if marked:
+        logger.info(
+            "event=tool_desc_compaction_skipped reason=marker_present tool_count=%d marked=%d",
+            len(tools),
+            marked,
+        )
         return payload, False, 0, 0
 
     strip_sem = strip_semantic_params()
