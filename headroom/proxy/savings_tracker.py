@@ -708,7 +708,7 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
         normalized["compression_savings_usd"] = round(
-            _coerce_float(entry.get("compression_savings_usd")), 6
+            _coerce_signed_float(entry.get("compression_savings_usd")), 6
         )
         normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
@@ -743,7 +743,7 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         # Absent in state files written before this field existed -> 0.
         normalized["tool_tokens_saved"] = _coerce_int(entry.get("tool_tokens_saved"))
         normalized["compression_savings_usd"] = round(
-            _coerce_float(entry.get("compression_savings_usd")), 6
+            _coerce_signed_float(entry.get("compression_savings_usd")), 6
         )
         normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
@@ -778,12 +778,12 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
     # cannot be recovered. Written out rather than inlined into the dict below:
     # a money path should not hinge on the reader parsing a nested ternary.
     is_pre_v6 = "compression_savings_list_usd" not in entry
-    savings_usd = _coerce_float(entry.get("compression_savings_usd"))
+    savings_usd = _coerce_signed_float(entry.get("compression_savings_usd"))
     if is_pre_v6:
         savings_list_usd = savings_usd
         savings_basis = BASIS_LIST
     else:
-        savings_list_usd = _coerce_float(entry.get("compression_savings_list_usd"))
+        savings_list_usd = _coerce_signed_float(entry.get("compression_savings_list_usd"))
         savings_basis = str(entry.get("savings_basis") or BASIS_UNKNOWN)
 
     return {
@@ -1130,7 +1130,7 @@ class SavingsTracker:
                 6,
             )
             lifetime["compression_savings_list_usd"] = round(
-                _coerce_float(lifetime.get("compression_savings_list_usd"))
+                _coerce_signed_float(lifetime.get("compression_savings_list_usd"))
                 + delta_savings_list_usd,
                 6,
             )
@@ -1167,7 +1167,8 @@ class SavingsTracker:
                 6,
             )
             session["compression_savings_list_usd"] = round(
-                _coerce_float(session.get("compression_savings_list_usd")) + delta_savings_list_usd,
+                _coerce_signed_float(session.get("compression_savings_list_usd"))
+                + delta_savings_list_usd,
                 6,
             )
             session["savings_basis"] = _blend_basis(session.get("savings_basis"), delta_basis)
@@ -1365,7 +1366,7 @@ class SavingsTracker:
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
-            entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
+            entry["compression_savings_usd"] + savings_usd_delta, 6
         )
         entry["total_input_tokens"] += max(input_tokens_delta, 0)
         entry["total_input_cost_usd"] = round(
@@ -1405,7 +1406,7 @@ class SavingsTracker:
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
         entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
-            entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
+            entry["compression_savings_usd"] + savings_usd_delta, 6
         )
         entry["total_input_tokens"] += max(input_tokens_delta, 0)
         entry["total_input_cost_usd"] = round(

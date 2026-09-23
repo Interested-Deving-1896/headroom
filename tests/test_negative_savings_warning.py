@@ -167,3 +167,91 @@ def test_the_other_buckets_keep_their_floor(tracker: SavingsTracker) -> None:
     )
 
     assert tracker._negative_savings_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Removing the floor at the point of measurement is not enough on its own. The
+# loss then has to survive every place it is added up, stored and read back,
+# and it did not: three separate clamps downstream re-floored it, so the
+# warning fired while every number an operator would actually look at still
+# read zero.
+# ---------------------------------------------------------------------------
+
+
+def _losing_turn(tracker: SavingsTracker, usd: float = -0.50, project: str = "acme") -> None:
+    tracker.record_request(
+        model="claude-opus-4-6",
+        provider="anthropic",
+        input_tokens=20_000,
+        tokens_saved=-5_000,
+        project=project,
+        estimated_savings_usd={
+            "compression": usd,
+            "tool_schema": 0.0,
+            "compression_list": usd,
+            "tool_schema_list": 0.0,
+            "basis": "mix",
+        },
+    )
+
+
+def test_the_loss_reaches_the_per_model_rollup(tmp_path) -> None:
+    """``by_model`` is where an operator finds WHICH model is losing money.
+
+    It floored the delta at zero, so the one breakdown that could answer that
+    question reported a clean zero for a turn that lost 50 cents.
+    """
+    tracker = SavingsTracker(path=str(tmp_path / "s.json"))
+
+    _losing_turn(tracker)
+
+    by_model = tracker._state["by_model"]
+    assert [e["compression_savings_usd"] for e in by_model.values()] == [-0.5]
+
+
+def test_the_loss_reaches_the_per_project_rollup(tmp_path) -> None:
+    tracker = SavingsTracker(path=str(tmp_path / "s.json"))
+
+    _losing_turn(tracker)
+
+    projects = tracker._state["projects"]
+    assert [e["compression_savings_usd"] for e in projects.values()] == [-0.5]
+
+
+def test_losses_accumulate_instead_of_resetting_each_turn(tmp_path) -> None:
+    """The list-priced column floored its own running total before adding to it.
+
+    Net effect: it only ever showed the MOST RECENT losing turn, so a
+    deployment three turns into a sustained loss looked like it had lost once.
+    """
+    tracker = SavingsTracker(path=str(tmp_path / "s.json"))
+
+    for _ in range(3):
+        _losing_turn(tracker)
+
+    lifetime = tracker._state["lifetime"]
+    assert lifetime["compression_savings_usd"] == pytest.approx(-1.5)
+    assert lifetime["compression_savings_list_usd"] == pytest.approx(-1.5)
+
+
+def test_a_loss_survives_a_restart(tmp_path) -> None:
+    """The load path floored too, so a restart erased whatever was preserved."""
+    path = str(tmp_path / "s.json")
+    tracker = SavingsTracker(path=path)
+    _losing_turn(tracker)
+
+    reloaded = SavingsTracker(path=path)
+
+    by_model = reloaded._state["by_model"]
+    assert [e["compression_savings_usd"] for e in by_model.values()] == [-0.5]
+
+
+def test_the_public_snapshot_shows_the_loss(tmp_path) -> None:
+    """What /stats serves must agree with what the warning said."""
+    tracker = SavingsTracker(path=str(tmp_path / "s.json"))
+
+    _losing_turn(tracker)
+    lifetime = tracker.snapshot()["lifetime"]
+
+    assert lifetime["compression_savings_usd"] == pytest.approx(-0.5)
+    assert lifetime["compression_savings_list_usd"] == pytest.approx(-0.5)
