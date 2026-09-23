@@ -782,18 +782,12 @@ async def test_a_live_pin_dials_the_address_and_an_unguarded_host_dials_the_name
 def _client_through_proxy(proxy_url: str) -> httpx.AsyncClient:
     """A client routing everything through ``proxy_url``, SOCKS included.
 
-    ``socksio`` is an optional httpx extra and is not installed here, so
-    httpcore substitutes a stub ``AsyncSOCKSProxy`` whose ``__init__`` refuses.
-    What is under test is the classification -- that a SOCKS pool is recognised
-    as one that resolves the target itself -- and that turns on the pool's
-    *type*, which the stub shares with the real one. So the SOCKS pool is
-    allocated without running its initialiser rather than skipping the case
-    wherever the extra is absent, which is everywhere in CI.
+    All three transports build a real pool. SOCKS needs httpx's ``socks`` extra
+    (``socksio``), which is in the dev dependencies for exactly this test: without
+    it httpcore substitutes a stub ``AsyncSOCKSProxy`` that cannot be constructed,
+    and the case degrades into asserting on a type instead of exercising the pool
+    the refusal actually has to classify.
     """
-    if proxy_url.startswith("socks"):
-        transport = httpx.AsyncHTTPTransport()
-        transport._pool = object.__new__(httpcore.AsyncSOCKSProxy)
-        return httpx.AsyncClient(mounts={"all://": transport})
     return httpx.AsyncClient(proxy=proxy_url)
 
 

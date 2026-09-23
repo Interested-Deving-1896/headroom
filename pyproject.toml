@@ -296,7 +296,11 @@ dev = [
     "litellm>=1.96.2,<2.0",       # see core deps note
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
-    "httpx[http2]>=0.24.0",
+    # socks: test_upstream_guard proves a guarded upstream is refused on EVERY
+    # supported proxy transport. Without the extra, httpcore substitutes a stub
+    # AsyncSOCKSProxy that cannot be constructed, and the SOCKS case degrades to
+    # asserting on a type rather than a real pool.
+    "httpx[http2,socks]>=0.24.0",
     "websockets>=13.0",
     "opentelemetry-sdk>=1.24.0",
     "opentelemetry-exporter-otlp-proto-http>=1.24.0",
