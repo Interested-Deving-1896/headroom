@@ -164,6 +164,37 @@ def _estimate_tokens(text: str) -> int:
     return max(1, _TOKEN_ESTIMATOR.count_text(text))
 
 
+def _ml_stage_deadline_seconds() -> float:
+    """Wall-clock ceiling for ALL ML (Kompress) work inside one request.
+
+    ``_kompress_max_tokens`` bounds a single block. It cannot bound a request:
+    the mixed-content path splits a payload into sections and calls
+    ``_try_ml_compressor`` once per section (see ``_compress_mixed``), so every
+    section can sit under the per-block ceiling while their sum runs for
+    minutes. #3711 reported ~70s on a 1.4MB tool_result of prose blocks
+    separated by small JSON objects -- with the size gate recording only
+    ``within`` -- which blew the 30s compression budget and then quarantined
+    compression for every following request.
+
+    So the guard has to match the budget's granularity: once this much
+    wall-clock has gone into ML for this request, remaining blocks take the
+    same fallback the size gate uses (TextCrusher / LogCompressor /
+    passthrough). Default 15s sits under the 30s
+    ``HEADROOM_COMPRESSION_TIMEOUT_SECONDS`` so we degrade to a partial
+    compression *before* the executor abandons a non-preemptible worker --
+    losing some savings beats losing the request and quarantining the stage.
+
+    ``0`` disables the ceiling (previous behavior).
+    """
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "15")),
+        )
+    except ValueError:
+        return 15.0
+
+
 def _compression_deadline_seconds() -> float:
     try:
         return max(
@@ -1851,6 +1882,10 @@ class _PerRequestRuntimeState:
 
     compression_policy: Any = None
     target_ratio: float | None = None
+    # Monotonic instant after which no further ML compression may START in
+    # this request (#3711). None = unarmed (direct `compress()` callers and
+    # tests keep the old unbounded behavior); armed by `apply()`.
+    ml_deadline: float | None = None
     force_kompress: bool = False
     skip_kompress: bool = False
     kompress_model: str | None = None
@@ -4148,12 +4183,29 @@ class ContentRouter(Transform):
         # (under the 50,000 cap, gate silent) but 55,557 estimator tokens, 11%
         # over. That is exactly the >30s non-preemptible ONNX inference this gate
         # exists to prevent (#1171).
-        if (
+        # Request-scoped ML ceiling (#3711). The size check below bounds ONE
+        # block; this bounds the request. Without it a payload split into many
+        # individually-small sections calls this function once per section, each
+        # passing the size gate, until the sum blows the compression budget and
+        # quarantines the stage for every later request. Checked before the size
+        # gate so an over-budget request stops paying the estimator too.
+        _deadline = self._runtime_state_var.get().ml_deadline
+        _over_budget = _deadline is not None and time.monotonic() >= _deadline
+        if _over_budget:
+            self._observe_kompress_size_gate("deadline")
+            logger.info(
+                "ML stage deadline reached; routing remaining blocks off ML "
+                "(~%d tok block). Partial compression beats a blown budget.",
+                _estimate_tokens(text_to_compress),
+            )
+
+        if _over_budget or (
             self._kompress_max_tokens > 0
             and _estimate_tokens(text_to_compress) > self._kompress_max_tokens
         ):
-            self._kompress_gate_fires += 1
-            self._observe_kompress_size_gate("exceeded")
+            if not _over_budget:
+                self._kompress_gate_fires += 1
+                self._observe_kompress_size_gate("exceeded")
             logger.info(
                 "kompress size-gate fired: ~%d tok (>%d) routed off ML (fire #%d)",
                 len(text_to_compress) // 4,
@@ -5141,7 +5193,15 @@ class ContentRouter(Transform):
         # call does. No `reset()` is needed: every `apply()` call installs
         # its own fresh object up front, so the next call on a reused worker
         # thread simply overwrites the ambient value before reading it.
-        self._runtime_state_var.set(_PerRequestRuntimeState())
+        # Arm the request-scoped ML ceiling here, at the one place that owns a
+        # whole request, so every section the router later visits shares one
+        # budget instead of each re-earning the per-block one (#3711).
+        _ml_budget = _ml_stage_deadline_seconds()
+        self._runtime_state_var.set(
+            _PerRequestRuntimeState(
+                ml_deadline=(time.monotonic() + _ml_budget) if _ml_budget > 0 else None
+            )
+        )
 
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
