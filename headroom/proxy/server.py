@@ -1959,9 +1959,11 @@ class HeadroomProxy(
         # `install_upstream_pinning` is what makes the SSRF guard's verdict
         # binding: a caller-supplied upstream that passed `is_safe_upstream_url`
         # is dialled at the address that was checked, instead of being resolved
-        # a second time here (DNS rebinding). It swaps the pool's DNS layer only
-        # — the clients themselves are built exactly as before, so proxies,
-        # trust_env, limits, HTTP/2 and connection reuse are unchanged.
+        # a second time here (DNS rebinding). It swaps the pool's DNS layer for
+        # direct routes, and refuses guarded upstreams on routes that cannot
+        # honour a pin at all — a proxy resolves the target itself, on its own
+        # network. Operator-configured upstreams have no pin and are untouched,
+        # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
         self.http_client = install_upstream_pinning(
             httpx.AsyncClient(http2=_http2, **_client_kwargs)
         )
