@@ -360,7 +360,10 @@ def test_unpinned_asset_is_refused_and_partial_deleted(monkeypatch, fake_urlopen
     assert type(exc.value) is binaries.UnpinnedDownload
     assert "HEADROOM_BINARIES_ALLOW_UNVERIFIED" in str(exc.value)
     # Nothing unverified is left in the cache for a later call to pick up.
-    assert not binaries._cached_path("difft", "0.64.0", binaries.detect_platform()).exists()
+    # Version read from the registry, not hardcoded: a hardcoded one silently
+    # starts asserting about a path that never existed after a version bump.
+    version = binaries._registry()["tools"]["difft"]["version"]
+    assert not binaries._cached_path("difft", version, binaries.detect_platform()).exists()
 
 
 def test_unpinned_asset_allowed_by_escape_hatch_warns_on_stderr(

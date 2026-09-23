@@ -342,6 +342,12 @@ def _allow_unverified(name: str) -> bool:
     so it goes to stderr as well as the logger: the logger is frequently
     unconfigured at proxy startup, and a silent downgrade is the failure mode
     this whole module exists to avoid.
+
+    Exactly once, though. With no handlers configured, logging's ``lastResort``
+    already writes WARNING to stderr, so printing unconditionally produced the
+    same sentence twice. Print only when a handler exists -- that is precisely
+    when ``lastResort`` will not fire, and when the log may be going somewhere
+    an operator is not watching, such as a file.
     """
     if not os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
         return False
@@ -351,7 +357,8 @@ def _allow_unverified(name: str) -> bool:
         "substituted binary will not be detected."
     )
     logger.warning("%s", message)
-    print(message, file=sys.stderr)
+    if logger.hasHandlers():
+        print(message, file=sys.stderr)
     return True
 
 
