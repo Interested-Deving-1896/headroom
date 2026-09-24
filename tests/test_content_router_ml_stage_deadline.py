@@ -200,4 +200,142 @@ def test_direct_compress_callers_stay_unarmed() -> None:
     not inherit a request budget nobody set.
     """
     router = cr.ContentRouter(cr.ContentRouterConfig())
-    assert router._runtime_state_var.get().ml_deadline is None
+    state = router._runtime_state_var.get()
+    assert state.ml_budget_active is False
+
+    # That default is instance-scoped and shared by every direct call for the
+    # life of the router, so charging it would accumulate across unrelated
+    # calls until ML switched itself off permanently.
+    router._charge_ml_time(5.0, "some text to compress")
+    assert state.ml_elapsed == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Review follow-ups: the budget must mean ML time, must refuse a call it cannot
+# afford, and must sit under the timeout that quarantines the stage.
+#
+# The original tests asserted that LATER model calls are skipped. That is not
+# the same claim as the request-wide time bound the module documents, and all
+# three gaps below passed those tests.
+# --------------------------------------------------------------------------- #
+
+
+class _SlowTokenizer(_Tokenizer):
+    """Expensive NON-ML prework: token counting during classification."""
+
+    def __init__(self, per_call_s: float) -> None:
+        self.per_call_s = per_call_s
+        self.calls = 0
+
+    def count_text(self, content: str) -> int:
+        self.calls += 1
+        time.sleep(self.per_call_s)
+        return super().count_text(content)
+
+
+@pytest.fixture
+def charged(monkeypatch) -> list[float]:
+    """Every increment billed to the ML budget, in order."""
+    seen: list[float] = []
+    real = cr.ContentRouter._charge_ml_time
+
+    def _spy(self, elapsed: float, text: str) -> None:
+        seen.append(elapsed)
+        real(self, elapsed, text)
+
+    monkeypatch.setattr(cr.ContentRouter, "_charge_ml_time", _spy)
+    return seen
+
+
+def test_non_ml_prework_does_not_consume_the_ml_budget(
+    gate_outcomes, slow_kompress, charged, monkeypatch
+) -> None:
+    """The budget was armed at ``apply()`` entry, so lifecycle work, message
+    classification and lossless transforms all ran it down before ML began --
+    while the log line claimed to measure time "in ML"."""
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "0.4")
+    router = cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True))
+
+    tokenizer = _SlowTokenizer(per_call_s=0.01)
+    started = time.monotonic()
+    router.apply(
+        _tool_result_messages(),
+        tokenizer,
+        frozen_message_count=1,
+        min_tokens_to_compress=1,
+    )
+    wall = time.monotonic() - started
+
+    assert tokenizer.calls > 0, "prework must actually have run"
+    assert slow_kompress.calls > 0, "prework time must not have spent the ML budget"
+    # The bound is on ML time, not on the call.
+    assert sum(charged) <= wall
+    assert sum(charged) == pytest.approx(slow_kompress.calls * slow_kompress.per_call_s, rel=0.5)
+
+
+def test_a_slow_call_cannot_be_admitted_against_a_budget_it_will_overrun(
+    gate_outcomes, charged, monkeypatch
+) -> None:
+    """Admission used to be ``now >= deadline`` only, so a call starting at
+    14.9s of a 15s budget ran to completion well past it -- the ONNX worker is
+    not preemptible, so nothing stops it once it has begun."""
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "0.5")
+    stub = _SlowKompress(per_call_s=0.35)
+    monkeypatch.setattr(cr.ContentRouter, "_get_kompress", lambda self: stub)
+    router = cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True))
+
+    _apply(router)
+
+    assert stub.calls >= 1, "the first block has no measurement yet and must run"
+    # The point of the change: total ML time stays inside the budget, rather
+    # than the budget merely being the moment after which no call STARTS.
+    assert sum(charged) <= 0.5, (
+        f"ML overran its 0.5s budget: {sum(charged):.2f}s across {stub.calls} calls"
+    )
+    assert gate_outcomes.get("deadline", 0) >= 1, "remaining blocks must route off ML"
+
+
+def test_budget_is_clamped_below_the_timeout_that_quarantines_the_stage(
+    monkeypatch,
+) -> None:
+    """A 15s guard under a 10s executor timeout can never fire first, which is
+    exactly the failure the ceiling exists to prevent."""
+    monkeypatch.delenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", raising=False)
+
+    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "30")
+    assert cr._ml_stage_deadline_seconds() == 15.0, "the documented default is unchanged"
+
+    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "10")
+    clamped = cr._ml_stage_deadline_seconds()
+    assert clamped == 5.0
+    assert clamped < 10.0, "must leave room to degrade before the executor gives up"
+
+    # The clamp only ever lowers: an explicit request below it is honoured.
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "2")
+    assert cr._ml_stage_deadline_seconds() == 2.0
+
+    # And 0 still disables the ceiling entirely.
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "0")
+    assert cr._ml_stage_deadline_seconds() == 0.0
+
+
+def test_a_failing_ml_call_still_draws_down_the_budget(charged, monkeypatch) -> None:
+    """Otherwise a request could retry its way past the ceiling: a compressor
+    that raises burns the same non-preemptible wall clock as one that returns."""
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "5")
+
+    class _Exploding(_SlowKompress):
+        def compress(self, text: str, **_kwargs: object):
+            self.calls += 1
+            time.sleep(self.per_call_s)
+            raise RuntimeError("onnx said no")
+
+    stub = _Exploding(per_call_s=0.05)
+    monkeypatch.setattr(cr.ContentRouter, "_get_kompress", lambda self: stub)
+    router = cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True))
+
+    _apply(router)
+
+    assert stub.calls > 0
+    assert charged, "a raising call must still be billed"
+    assert sum(charged) > 0.0
