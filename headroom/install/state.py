@@ -14,8 +14,8 @@ from typing import Any
 from .models import ArtifactRecord, DeploymentManifest, ManagedMutation, iso_utc_now
 from .paths import (
     POSIX_MODES_ENFORCED,
-    SECRET_DIR_MODE,
-    SECRET_FILE_MODE,
+    OWNER_ONLY_DIR_MODE,
+    OWNER_ONLY_FILE_MODE,
     chmod_owner_only,
     deploy_root,
     manifest_path,
@@ -55,7 +55,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        chmod_owner_only(tmp_path, SECRET_FILE_MODE)
+        chmod_owner_only(tmp_path, OWNER_ONLY_FILE_MODE)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -72,7 +72,7 @@ def save_manifest(manifest: DeploymentManifest) -> None:
     The profile directory and the manifest are owner-only: ``base_env`` carries
     whatever ``headroom install --env`` was given, which is the supported way to
     hand a provider API key to a supervised proxy. See
-    :data:`headroom.install.paths.SECRET_DIR_MODE`.
+    :data:`headroom.install.paths.OWNER_ONLY_DIR_MODE`.
     """
     try:
         root = profile_root(manifest.profile)
@@ -84,13 +84,13 @@ def save_manifest(manifest: DeploymentManifest) -> None:
         # through `mkstemp`, which is 0600 from birth, so a directory that
         # could not be narrowed weakens the outer layer without exposing the
         # file. Warn rather than abandon a deployment over it.
-        if not chmod_owner_only(root, SECRET_DIR_MODE) and POSIX_MODES_ENFORCED:
+        if not chmod_owner_only(root, OWNER_ONLY_DIR_MODE) and POSIX_MODES_ENFORCED:
             logger.warning(
                 "Deployment profile directory %s is not owner-only; the "
                 "manifest inside it is still 0o%o, but other local users can "
                 "list the directory.",
                 root,
-                SECRET_FILE_MODE,
+                OWNER_ONLY_FILE_MODE,
             )
         manifest.updated_at = iso_utc_now()
         path = manifest_path(manifest.profile)

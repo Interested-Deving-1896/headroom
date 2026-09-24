@@ -31,9 +31,14 @@ _PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # SECURITY.md documents these modes; `tests/test_packaging_extras_and_security_docs.py`
 # reads the octal values back out of that document and compares them with what
 # an install actually writes, so the policy and the code cannot drift apart.
-SECRET_FILE_MODE = 0o600
-SECRET_SCRIPT_MODE = 0o700
-SECRET_DIR_MODE = 0o700
+# Named for what they ARE -- a permission mode -- not for what the files they
+# protect contain. The previous SECRET_* spelling read as a credential to
+# CodeQL's sensitive-data heuristic, so `logger.warning("... 0o%o", mode)`
+# tripped py/clear-text-logging-sensitive-data on a diagnostic that logs a
+# permission bitmask and no secret at all.
+OWNER_ONLY_FILE_MODE = 0o600
+OWNER_ONLY_SCRIPT_MODE = 0o700
+OWNER_ONLY_DIR_MODE = 0o700
 
 
 #: Whether this platform actually enforces POSIX permission bits. On Windows

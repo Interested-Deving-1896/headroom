@@ -22,8 +22,8 @@ from headroom._subprocess import run
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
     POSIX_MODES_ENFORCED,
-    SECRET_FILE_MODE,
-    SECRET_SCRIPT_MODE,
+    OWNER_ONLY_FILE_MODE,
+    OWNER_ONLY_SCRIPT_MODE,
     chmod_owner_only,
     unix_ensure_script_path,
     unix_run_script_path,
@@ -153,7 +153,7 @@ def _render_unix_runner(
         + "exec "
         + " ".join(shlex.quote(x) for x in command)
         + "\n",
-        SECRET_SCRIPT_MODE,
+        OWNER_ONLY_SCRIPT_MODE,
     )
     return ArtifactRecord(kind="script", path=str(path))
 
@@ -177,7 +177,7 @@ def _render_windows_runner(
     _write_private_text(
         ps1_path,
         f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n",
-        SECRET_FILE_MODE,
+        OWNER_ONLY_FILE_MODE,
     )
     # The .cmd shim holds no secrets — it only invokes the .ps1 — so it keeps a
     # conventional mode.

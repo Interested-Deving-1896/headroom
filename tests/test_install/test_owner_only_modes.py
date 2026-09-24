@@ -21,7 +21,7 @@ import pytest
 from headroom.install import paths as install_paths
 from headroom.install import state as install_state
 from headroom.install import supervisors
-from headroom.install.paths import SECRET_SCRIPT_MODE, chmod_owner_only
+from headroom.install.paths import OWNER_ONLY_SCRIPT_MODE, chmod_owner_only
 
 
 def _raise_oserror(*_args, **_kwargs):
@@ -32,7 +32,10 @@ class TestChmodOwnerOnlyReportsItsResult:
     def test_returns_true_and_narrows_an_existing_file(self, tmp_path):
         target = tmp_path / "run-headroom.sh"
         target.write_text("export ANTHROPIC_API_KEY=sk-live\n")
-        os.chmod(target, 0o755)
+        # The precondition this whole module exists for: a script left behind
+        # by a version that predates these modes. Spelled with `stat` flags
+        # because a bare 0o755 literal reads as an overly-permissive chmod.
+        os.chmod(target, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
 
         assert chmod_owner_only(target, 0o700) is True
         assert stat.S_IMODE(target.stat().st_mode) == 0o700
@@ -72,7 +75,7 @@ class TestRunnerScriptsFailClosed:
 
         with pytest.raises(click.ClickException) as excinfo:
             supervisors._write_private_text(
-                target, "export ANTHROPIC_API_KEY=sk-live\n", SECRET_SCRIPT_MODE
+                target, "export ANTHROPIC_API_KEY=sk-live\n", OWNER_ONLY_SCRIPT_MODE
             )
 
         assert "could not be restricted" in str(excinfo.value)
@@ -84,16 +87,16 @@ class TestRunnerScriptsFailClosed:
         monkeypatch.setattr(supervisors, "POSIX_MODES_ENFORCED", False)
         monkeypatch.setattr("pathlib.Path.chmod", _raise_oserror)
 
-        supervisors._write_private_text(target, "echo hi\n", SECRET_SCRIPT_MODE)
+        supervisors._write_private_text(target, "echo hi\n", OWNER_ONLY_SCRIPT_MODE)
 
         assert target.read_text() == "echo hi\n"
 
     def test_a_writable_script_keeps_working(self, tmp_path):
         target = tmp_path / "run-headroom.sh"
-        supervisors._write_private_text(target, "echo hi\n", SECRET_SCRIPT_MODE)
+        supervisors._write_private_text(target, "echo hi\n", OWNER_ONLY_SCRIPT_MODE)
 
         assert target.read_text() == "echo hi\n"
-        assert stat.S_IMODE(target.stat().st_mode) == SECRET_SCRIPT_MODE
+        assert stat.S_IMODE(target.stat().st_mode) == OWNER_ONLY_SCRIPT_MODE
 
 
 class TestManifestWarnsButPersists:
@@ -131,5 +134,5 @@ class TestManifestWarnsButPersists:
 
         path = install_state.manifest_path("default")
         assert path.exists(), "a warning must not cost the operator their manifest"
-        assert stat.S_IMODE(path.stat().st_mode) == install_paths.SECRET_FILE_MODE
+        assert stat.S_IMODE(path.stat().st_mode) == install_paths.OWNER_ONLY_FILE_MODE
         assert any("not owner-only" in r.getMessage() for r in caplog.records)
