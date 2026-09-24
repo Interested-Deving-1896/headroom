@@ -21,9 +21,9 @@ from headroom._subprocess import run
 
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
-    POSIX_MODES_ENFORCED,
     OWNER_ONLY_FILE_MODE,
     OWNER_ONLY_SCRIPT_MODE,
+    POSIX_MODES_ENFORCED,
     chmod_owner_only,
     unix_ensure_script_path,
     unix_run_script_path,

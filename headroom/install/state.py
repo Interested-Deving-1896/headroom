@@ -13,9 +13,9 @@ from typing import Any
 
 from .models import ArtifactRecord, DeploymentManifest, ManagedMutation, iso_utc_now
 from .paths import (
-    POSIX_MODES_ENFORCED,
     OWNER_ONLY_DIR_MODE,
     OWNER_ONLY_FILE_MODE,
+    POSIX_MODES_ENFORCED,
     chmod_owner_only,
     deploy_root,
     manifest_path,
