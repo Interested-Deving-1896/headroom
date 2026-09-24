@@ -10,6 +10,7 @@ import copy
 from typing import Any
 
 from headroom.proxy.output_shaper import (
+    DEFAULT_VERBOSITY_LEVEL,
     OutputShaperSettings,
     TurnKind,
     apply_openai_responses_verbosity_steering,
@@ -180,10 +181,10 @@ class TestShapeRequest:
         }
         result = shape_request(body, ENABLED)
         assert result.changed is True
-        assert result.labels == ["output_shaper:verbosity:L3"]
+        assert result.labels == [f"output_shaper:verbosity:L{DEFAULT_VERBOSITY_LEVEL}"]
         assert body["output_config"]["effort"] == "xhigh", "must not touch effort"
         assert body["thinking"] == {"type": "adaptive"}, "must not touch thinking"
-        assert body["system"][1]["text"] == steering_text(3)
+        assert body["system"][1]["text"] == steering_text(DEFAULT_VERBOSITY_LEVEL)
 
     def test_new_ask_gets_steering_but_keeps_effort(self):
         body = {
@@ -192,7 +193,7 @@ class TestShapeRequest:
             "output_config": {"effort": "xhigh"},
         }
         result = shape_request(body, ENABLED)
-        assert result.labels == ["output_shaper:verbosity:L3"]
+        assert result.labels == [f"output_shaper:verbosity:L{DEFAULT_VERBOSITY_LEVEL}"]
         assert body["output_config"]["effort"] == "xhigh"
 
     def test_second_pass_is_stable(self):
@@ -282,8 +283,8 @@ class TestShapeOpenAIChatRequest:
         }
         result = shape_openai_chat_request(body, ENABLED)
         assert result.changed is True
-        assert result.labels == ["output_shaper:verbosity:L3"]
-        assert steering_text(3) in body["messages"][0]["content"]
+        assert result.labels == [f"output_shaper:verbosity:L{DEFAULT_VERBOSITY_LEVEL}"]
+        assert steering_text(DEFAULT_VERBOSITY_LEVEL) in body["messages"][0]["content"]
         # User turn is untouched.
         assert body["messages"][1] == {"role": "user", "content": "hi"}
 
@@ -398,11 +399,13 @@ class TestCacheModeSuppressesSteeringOnly:
         assert steering_allowed_for(SimpleNamespace(mode="cache")) is False
         assert steering_allowed_for(None) is True, "absent config must not disable levers"
 
-    def test_cache_mode_resolves_level_zero(self):
+    def test_cache_mode_steers_at_the_startup_level(self):
+        """Cache mode used to force 0 here. What it must prevent is a level that
+        MOVES; a level fixed at startup cannot, so it is steered at."""
         from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
 
         settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
-        assert resolve_verbosity_level(settings) == (0, "cache_mode")
+        assert resolve_verbosity_level(settings) == (3, "cache_mode_default")
 
     def test_cache_mode_honours_a_pinned_manual_level(self, monkeypatch):
         """A level pinned before startup never moves, so it cannot bust a cache.
@@ -418,49 +421,73 @@ class TestCacheModeSuppressesSteeringOnly:
         settings = OutputShaperSettings(enabled=True, verbosity_level=4, steering_enabled=False)
         assert resolve_verbosity_level(settings) == (4, "env_pinned")
 
-    def test_cache_mode_still_drops_a_learned_level(self, tmp_path, monkeypatch):
-        """``verbosity.json`` appears the moment someone runs ``learn``."""
+    def test_shaper_alone_steers_at_l2_in_cache_mode(self, monkeypatch):
+        """``HEADROOM_OUTPUT_SHAPER=1`` must be sufficient on its own.
+
+        The shaper is opt-in, so an enabled shaper is already an explicit
+        request; there is nothing further to ask the operator for. Previously
+        this resolved to 0 and the feature did nothing in the default mode.
+        """
+        from headroom.proxy import runtime_env
+        from headroom.proxy.output_shaper import (
+            DEFAULT_VERBOSITY_LEVEL,
+            OutputShaperSettings,
+            resolve_verbosity_level,
+        )
+
+        monkeypatch.setattr(runtime_env, "getenv", lambda k, d="": d)
+        settings = OutputShaperSettings.from_env(enabled=True, steering_enabled=False)
+        assert settings.enabled is True
+        assert resolve_verbosity_level(settings) == (DEFAULT_VERBOSITY_LEVEL, "cache_mode_default")
+        assert DEFAULT_VERBOSITY_LEVEL == 2
+
+    def test_cache_mode_ignores_a_learned_level(self, tmp_path, monkeypatch):
+        """``verbosity.json`` appears the moment someone runs ``learn``, so it
+        must not be consulted where a mid-conversation change busts a cache."""
         from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
 
         monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
         monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
-        (tmp_path / "verbosity.json").write_text('{"verbosity_level": 3}')
-
-        settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
-        assert resolve_verbosity_level(settings) == (0, "cache_mode")
-
-    def test_cache_mode_still_drops_a_controller_level(self, tmp_path, monkeypatch):
-        """The AIMD controller rewrites its state file while it hunts."""
-        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
-
-        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
-        monkeypatch.setenv("HEADROOM_VERBOSITY_AUTOTUNE", "1")
-        monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
-        (tmp_path / "verbosity_controller.json").write_text('{"level": 2}')
+        (tmp_path / "verbosity.json").write_text('{"verbosity_level": 4}')
 
         settings = OutputShaperSettings(enabled=True, verbosity_level=2, steering_enabled=False)
-        assert resolve_verbosity_level(settings) == (0, "cache_mode")
+        assert resolve_verbosity_level(settings) == (2, "cache_mode_default")
 
-    def test_a_dropped_level_is_reported_once(self, tmp_path, monkeypatch, caplog):
-        """Silently resolving to 0 is invisible from outside the proxy."""
+    def test_cache_mode_ignores_the_controller_and_says_so_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Autotune silently doing nothing is invisible from outside."""
         import logging
 
         from headroom.proxy import output_shaper
         from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
 
         monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        monkeypatch.setenv("HEADROOM_VERBOSITY_AUTOTUNE", "1")
         monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
-        (tmp_path / "verbosity.json").write_text('{"verbosity_level": 3}')
-        output_shaper._CACHE_MODE_DROPS_REPORTED.clear()
+        (tmp_path / "verbosity_controller.json").write_text('{"level": 4}')
+        output_shaper._REPORTED.clear()
 
-        settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
+        settings = OutputShaperSettings(enabled=True, verbosity_level=2, steering_enabled=False)
         with caplog.at_level(logging.WARNING, logger="headroom.proxy.output_shaper"):
-            resolve_verbosity_level(settings)
+            assert resolve_verbosity_level(settings) == (2, "cache_mode_default")
             resolve_verbosity_level(settings)
 
-        warnings = [r for r in caplog.records if "dropped in cache mode" in r.getMessage()]
+        warnings = [r for r in caplog.records if "AUTOTUNE" in r.getMessage()]
         assert len(warnings) == 1, "must not reprint on every request"
-        assert "HEADROOM_VERBOSITY_LEVEL=3" in warnings[0].getMessage()
+        assert "HEADROOM_MODE=token" in warnings[0].getMessage()
+
+    def test_cache_mode_reads_no_workspace_files(self, monkeypatch):
+        """Resolution runs per request; the default mode must not stat files."""
+        import headroom.paths as paths
+        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
+
+        def _boom():
+            raise AssertionError("workspace_dir() must not be consulted in cache mode")
+
+        monkeypatch.setattr(paths, "workspace_dir", _boom)
+        settings = OutputShaperSettings(enabled=True, verbosity_level=2, steering_enabled=False)
+        assert resolve_verbosity_level(settings) == (2, "cache_mode_default")
 
     def test_pinned_level_keeps_the_system_array_byte_stable_across_turns(self, monkeypatch):
         """The cache-safety claim, asserted rather than argued.

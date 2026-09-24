@@ -62,6 +62,7 @@ from headroom.rollout import FeatureDecisionReason
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_VERBOSITY_LEVEL",
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
@@ -80,12 +81,23 @@ __all__ = [
 _replace_or_append_steering_block = replace_or_append_steering_block
 
 
+#: Level handed to an operator who turned the shaper on and said nothing else.
+#: Two, not three: L3 instructs the model to drop content ("give conclusions
+#: only; omit rationale"), which reads as the model getting worse to someone who
+#: did not ask for it -- the same reasoning the feature's own rollout spec gives
+#: for not defaulting the shaper on at all. L2 only forbids ceremony and
+#: restatement. Measured on a long explain-with-code turn (3 paired runs,
+#: non-overlapping ranges): 2375 -> 1663 output tokens, -30%, with no visible
+#: loss of content.
+DEFAULT_VERBOSITY_LEVEL = 2
+
+
 @dataclass(frozen=True)
 class OutputShaperSettings:
     """Output-shaping settings with rollout enablement injected by the proxy."""
 
     enabled: bool = False
-    verbosity_level: int = 3
+    verbosity_level: int = DEFAULT_VERBOSITY_LEVEL
     # False in ``mode="cache"``. Steering is the one lever that writes into the
     # provider prefix-cache key (it appends to the system-prompt tail, and on a
     # body with no system field it creates one); effort routing and the
@@ -110,9 +122,11 @@ class OutputShaperSettings:
                 "yes",
             )
         try:
-            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "3"))
+            level = int(
+                runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", str(DEFAULT_VERBOSITY_LEVEL))
+            )
         except ValueError:
-            level = 2
+            level = DEFAULT_VERBOSITY_LEVEL
         level = max(0, min(4, level))
         return cls(
             enabled=enabled,
@@ -180,10 +194,17 @@ def steering_allowed_for(config: Any) -> bool:
     return getattr(config, "mode", None) != "cache"
 
 
-#: ``(level, source)`` pairs already reported as dropped by cache mode. Keyed so
-#: a level change still speaks up, but a steady state does not reprint on every
-#: request of every conversation.
-_CACHE_MODE_DROPS_REPORTED: set[tuple[int, str]] = set()
+#: Keys already warned about. Resolution runs on every request of every
+#: conversation, so an unguarded warning would be one log line per turn.
+_REPORTED: set[str] = set()
+
+
+def _report_once(key: str, message: str, *args: Any) -> None:
+    """Warn the first time only. Cleared by tests via ``_REPORTED.clear()``."""
+    if key in _REPORTED:
+        return
+    _REPORTED.add(key)
+    logger.warning(message, *args)
 
 
 def _resolve_unpinned_level(settings: OutputShaperSettings) -> tuple[int, str]:
@@ -260,35 +281,47 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
     $0.000024 per turn at Sonnet cache-read rates, against a measured ~700
     output tokens saved per turn — roughly 450x the other way).
 
-    A pinned level is the one source that cannot move mid-conversation: it is
-    read from the environment and the precedence above already resolves it
-    before the controller and the learned profile are consulted. So it is
-    allowed through in cache mode, reported as ``env_pinned`` so an operator
-    can see steering is running there by explicit request. The controller and
-    learned profile stay banned — those are exactly the sources that rewrite
-    themselves while conversations are open.
+    What matters is therefore not WHICH level, but whether it can move. Both
+    sources that cannot move are allowed through in cache mode:
+
+    * an explicit ``HEADROOM_VERBOSITY_LEVEL`` → ``env_pinned``
+    * otherwise the settings level, fixed at startup → ``cache_mode_default``
+
+    The second is what makes ``HEADROOM_OUTPUT_SHAPER=1`` sufficient on its
+    own. The shaper is opt-in (see the ``proxy_output_shaper`` rollout spec, which
+    deliberately does not default-enable it), so an enabled shaper is already an
+    explicit request and there is nothing further to ask the operator for.
+
+    The controller and the learned profile stay out of cache mode entirely —
+    those are exactly the sources that rewrite themselves while conversations
+    are open. Skipping them also spares the default mode two filesystem stats
+    per request.
     """
     if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
         return settings.verbosity_level, ("env" if settings.steering_enabled else "env_pinned")
 
     if not settings.steering_enabled:
-        # Level 0 is the documented "no steering" value, so this disables the
-        # only cache-key-mutating lever while leaving effort routing on. Say so
-        # once: a learned or autotuned level silently resolving to 0 is the
-        # shape of bug an operator cannot see from the outside.
-        level, source = _resolve_unpinned_level(settings)
-        if level > 0 and (level, source) not in _CACHE_MODE_DROPS_REPORTED:
-            _CACHE_MODE_DROPS_REPORTED.add((level, source))
-            logger.warning(
-                "OutputShaper: verbosity L%d (%s) dropped in cache mode — that source can "
-                "change mid-conversation and would bust the prefix cache. Set "
-                "HEADROOM_VERBOSITY_LEVEL=%d before starting the proxy to pin it and keep "
-                "steering on.",
-                level,
-                source,
-                level,
+        # Cache mode. The shaper is opt-in (see the ``proxy_output_shaper``
+        # rollout spec), so an enabled shaper is already an explicit operator
+        # act -- there is nothing further to ask for. Steer at the settings
+        # level, which was fixed at startup and cannot move.
+        #
+        # The controller and the learned profile are deliberately NOT consulted
+        # here. Both rewrite their files while conversations are open, and a
+        # level that moves mid-conversation rewrites the system array, which
+        # sits inside the cached prefix of every message-level cache_control
+        # breakpoint. That is the bust this mode exists to prevent -- and
+        # skipping the lookup also spares the default mode two filesystem stats
+        # per request.
+        if runtime_env.getenv("HEADROOM_VERBOSITY_AUTOTUNE", "").lower() in ("1", "true", "yes"):
+            _report_once(
+                "autotune_in_cache_mode",
+                "OutputShaper: HEADROOM_VERBOSITY_AUTOTUNE is set but the AIMD controller is "
+                "not consulted in cache mode — a level that moves mid-conversation busts the "
+                "prefix cache. Steering at L%d. Set HEADROOM_MODE=token to autotune.",
+                settings.verbosity_level,
             )
-        return 0, "cache_mode"
+        return settings.verbosity_level, "cache_mode_default"
 
     return _resolve_unpinned_level(settings)
 

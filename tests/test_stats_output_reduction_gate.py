@@ -230,11 +230,10 @@ def test_stats_publishes_in_cache_mode_when_the_level_is_pinned(tmp_path, monkey
     assert payload["method"] == "measured"
 
 
-def test_stats_gates_cache_mode_when_the_level_is_only_learned(tmp_path, monkeypatch):
-    """``mode="cache"`` still forces a learned level to 0 in the handlers, so
-    /stats must not publish the ledger as this deployment's live layer."""
+def test_stats_publishes_in_cache_mode_with_the_shaper_alone(tmp_path, monkeypatch):
+    """An enabled shaper steers at the default level in cache mode, so /stats
+    must report it live -- with no HEADROOM_VERBOSITY_LEVEL set at all."""
     monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
-    (tmp_path / "verbosity.json").write_text('{"verbosity_level": 3}')
     payload = _stats_output_reduction(tmp_path, monkeypatch, mode="cache")
-    assert payload["active"] is False
-    assert payload["method"] == "inactive"
+    assert payload["active"] is True
+    assert payload["method"] == "measured"
