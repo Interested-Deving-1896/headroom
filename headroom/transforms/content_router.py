@@ -1866,6 +1866,13 @@ class _PerRequestRuntimeState:
     # a compression-policy misapplication.
     protect_read_tool_ids: set[str] = field(default_factory=set)
     protect_read_msg_indices: set[int] = field(default_factory=set)
+    # ``time.perf_counter()`` origin shared by every kompress call this
+    # request makes. ``HEADROOM_COMPRESSION_DEADLINE_MS`` is a deadline on
+    # kompress inference, but each ``compress()`` call started its own clock,
+    # so the budget bounded a BLOCK and a request with a dozen blocks could
+    # spend a dozen budgets. Set once per ``apply()``; see
+    # ``_try_ml_compressor``.
+    kompress_deadline_started_at: float | None = None
 
 
 # Monotonic counter so each ContentRouter instance gets a uniquely named
@@ -4232,6 +4239,18 @@ class ContentRouter(Transform):
                         # don't accept the kwarg are unaffected on the common path.
                         if protected:
                             compress_kwargs["ccr_original"] = content
+                        # One deadline for the whole request, not one per
+                        # block. Without this a request with N compressible
+                        # blocks gets N full deadlines and can run far past
+                        # the pipeline's own compression timeout; the worker
+                        # that overruns cannot be preempted, so it opens the
+                        # timeout-debt quarantine and every request behind it
+                        # forwards with no compression at all.
+                        deadline_origin = self._runtime_state_var.get().kompress_deadline_started_at
+                        if deadline_origin is not None and getattr(
+                            compressor, "shares_request_deadline", False
+                        ):
+                            compress_kwargs["_deadline_started_at"] = deadline_origin
                         result = compressor.compress(text_to_compress, **compress_kwargs)
                         compressed = result.compressed
                         compressed_tokens = result.compressed_tokens
@@ -5141,7 +5160,12 @@ class ContentRouter(Transform):
         # call does. No `reset()` is needed: every `apply()` call installs
         # its own fresh object up front, so the next call on a reused worker
         # thread simply overwrites the ambient value before reading it.
-        self._runtime_state_var.set(_PerRequestRuntimeState())
+        # The kompress deadline origin is stamped HERE, with the rest of the
+        # per-request state, so every block this call compresses draws down one
+        # shared budget instead of restarting it.
+        self._runtime_state_var.set(
+            _PerRequestRuntimeState(kompress_deadline_started_at=time.perf_counter())
+        )
 
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
@@ -5234,6 +5258,15 @@ class ContentRouter(Transform):
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
+        # Per-message veto from a compression hook (``CompressionHooks.
+        # protect_messages``). Distinct from ``biases``, which is a soft
+        # multiplier on how aggressively a compressor prunes: several
+        # strategies clamp or ignore it, so a bias — however large — cannot
+        # express "leave this one alone". This can. Empty unless a hook is
+        # installed, so the default path is unchanged.
+        hook_protect: set[int] = {
+            int(i) for i in (kwargs.get("protect") or ()) if isinstance(i, (int, bool))
+        }
 
         # Build tool name map for exclusion checking
         tool_name_map = self._build_tool_name_map(messages)
@@ -5532,6 +5565,14 @@ class ContentRouter(Transform):
             role = message.get("role", "")
             content = message.get("content", "")
             bias = 1.0  # Default bias, may be overridden for tool messages
+
+            # Hook veto, checked before any routing decision so it covers both
+            # the content-block path and the string path below.
+            if i in hook_protect:
+                result_slots[i] = message
+                transforms_applied.append("router:protected:hook")
+                route_counts["hook_protected"] = route_counts.get("hook_protected", 0) + 1
+                continue
 
             messages_from_end = num_messages - i
             # The caller's own words stay verbatim on a replaying path even
