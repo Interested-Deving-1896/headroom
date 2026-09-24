@@ -153,7 +153,13 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
-from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
+from headroom.proxy.models import (  # noqa: F401
+    CacheEntry,
+    ProxyConfig,
+    RateLimitState,
+    RequestLog,
+    default_periodic_malloc_trim,
+)
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
     PROXY_MODE_TOKEN,
@@ -3838,8 +3844,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.debug_introspection import (
         collect_tasks as _collect_tasks,
     )
-    from headroom.proxy.loopback_guard import require_loopback as _require_loopback
-    from headroom.proxy.loopback_guard import require_same_origin as _require_same_origin
+    from headroom.proxy.loopback_guard import (
+        require_loopback as _require_loopback,
+    )
+    from headroom.proxy.loopback_guard import (
+        require_loopback_or_container_gateway as _require_loopback_or_container_gateway,
+    )
+    from headroom.proxy.loopback_guard import (
+        require_same_origin as _require_same_origin,
+    )
 
     def _require_loopback_or_trusted_dashboard_client(request: Request) -> None:
         """Allow loopback callers, or gateway-forwarded dashboard clients.
@@ -5607,7 +5620,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _compress_dependencies = (
         []
         if _get_env_bool("HEADROOM_COMPRESS_ALLOW_REMOTE", False)
-        else [Depends(_require_loopback)]
+        else [Depends(_require_loopback_or_container_gateway)]
     )
 
     @app.post("/v1/compress", dependencies=_compress_dependencies)
@@ -5723,7 +5736,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         http_proxy=os.environ.get("HEADROOM_HTTP_PROXY") or None,
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         periodic_malloc_trim_enabled=_get_env_bool(
-            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+            "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
