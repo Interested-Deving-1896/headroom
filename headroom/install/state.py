@@ -13,6 +13,7 @@ from typing import Any
 
 from .models import ArtifactRecord, DeploymentManifest, ManagedMutation, iso_utc_now
 from .paths import (
+    POSIX_MODES_ENFORCED,
     SECRET_DIR_MODE,
     SECRET_FILE_MODE,
     chmod_owner_only,
@@ -79,7 +80,18 @@ def save_manifest(manifest: DeploymentManifest) -> None:
         # `exist_ok=True` leaves a pre-existing directory's mode alone, and a
         # profile created before this change is 0755, so narrow it every save
         # rather than only at creation.
-        chmod_owner_only(root, SECRET_DIR_MODE)
+        # Not fatal, unlike the runner script: the manifest itself is created
+        # through `mkstemp`, which is 0600 from birth, so a directory that
+        # could not be narrowed weakens the outer layer without exposing the
+        # file. Warn rather than abandon a deployment over it.
+        if not chmod_owner_only(root, SECRET_DIR_MODE) and POSIX_MODES_ENFORCED:
+            logger.warning(
+                "Deployment profile directory %s is not owner-only; the "
+                "manifest inside it is still 0o%o, but other local users can "
+                "list the directory.",
+                root,
+                SECRET_FILE_MODE,
+            )
         manifest.updated_at = iso_utc_now()
         path = manifest_path(manifest.profile)
         _atomic_write_text(path, json.dumps(asdict(manifest), indent=2) + "\n")

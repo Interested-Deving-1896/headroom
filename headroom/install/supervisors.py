@@ -21,6 +21,7 @@ from headroom._subprocess import run
 
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
+    POSIX_MODES_ENFORCED,
     SECRET_FILE_MODE,
     SECRET_SCRIPT_MODE,
     chmod_owner_only,
@@ -68,7 +69,23 @@ def _write_private_text(path: Path, data: str, mode: int) -> None:
     # `Path.write_text` produced before, on every platform.
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(data)
-    chmod_owner_only(path, mode)
+    if not chmod_owner_only(path, mode) and POSIX_MODES_ENFORCED:
+        # Fail closed. The O_CREAT mode above covers a file we created, but an
+        # existing inode keeps its old mode through O_TRUNC, so on this path the
+        # chmod is the only thing narrowing a 0755 script written by an earlier
+        # version -- and the script `export`s every entry of `manifest.base_env`
+        # in cleartext, which is where `headroom install --env` puts a provider
+        # API key. Continuing would leave that key readable by every local user
+        # while the installer reported success. Remove it rather than hand back
+        # a half-protected secret; on platforms that do not enforce POSIX modes
+        # at all this cannot trigger, and SECURITY.md says so.
+        path.unlink(missing_ok=True)
+        raise click.ClickException(
+            f"Refusing to write {path}: its permissions could not be restricted "
+            f"to {oct(mode)}, and the file carries any API key passed to "
+            f"`headroom install --env` in cleartext. Check the filesystem's "
+            f"mount options and ownership, then re-run."
+        )
 
 
 def _validated_env_items(env: dict[str, str] | None) -> list[tuple[str, str]]:

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
 import click
 
 from headroom import paths as _paths
+
+logger = logging.getLogger(__name__)
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -32,18 +36,59 @@ SECRET_SCRIPT_MODE = 0o700
 SECRET_DIR_MODE = 0o700
 
 
-def chmod_owner_only(path: Path, mode: int) -> None:
-    """Best-effort ``chmod`` to an owner-only ``mode``.
+#: Whether this platform actually enforces POSIX permission bits. On Windows
+#: access is governed by ACLs and ``chmod`` only toggles the read-only flag, so
+#: it SUCCEEDS without establishing the requested mode — which is why the check
+#: below reads the mode back rather than trusting the call not to raise.
+POSIX_MODES_ENFORCED = os.name == "posix"
 
-    POSIX permission bits are advisory on Windows (access is governed by ACLs)
-    and some filesystems reject ``chmod`` outright; a deployment must not fail
-    to install over it, so a failure is logged by the caller's context rather
-    than raised.
+
+def chmod_owner_only(path: Path, mode: int) -> bool:
+    """Narrow ``path`` to an owner-only ``mode``. Returns whether that took.
+
+    This used to swallow every ``OSError`` and return nothing, so a caller had
+    no way to tell a restricted file from an unrestricted one and continued as
+    if the documented mode had been established. That is the wrong default for
+    the two places it matters, because both NARROW A PRE-EXISTING INODE rather
+    than create one: a profile directory made before these modes existed is
+    0755, and a runner script rewritten through ``O_TRUNC`` keeps whatever mode
+    it already had. In both cases this chmod is the only thing standing between
+    a provider API key and every local user, and a silent failure left the
+    caller asserting a guarantee it did not have.
+
+    The result is verified with ``stat`` instead of inferred from ``chmod`` not
+    raising, because on Windows it does not raise and does not work either.
+
+    Returns ``True`` only when the mode is now exactly ``mode``. A caller
+    holding secret-bearing content must act on ``False``; see
+    :func:`headroom.install.supervisors._write_private_text`, which refuses to
+    leave the file behind.
     """
     try:
         path.chmod(mode)
-    except OSError:  # pragma: no cover - platform/filesystem dependent
-        pass
+        actual = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        logger.warning(
+            "Could not restrict %s to mode 0o%o (%s); it may be readable by other local users.",
+            path,
+            mode,
+            exc,
+        )
+        return False
+    if actual != mode:
+        # Expected on Windows, where the bits are advisory -- noise there, a
+        # real finding on POSIX.
+        logger.log(
+            logging.WARNING if POSIX_MODES_ENFORCED else logging.DEBUG,
+            "%s is mode 0o%o after asking for 0o%o; this platform does not "
+            "enforce POSIX permission bits, so the file's protection comes "
+            "from its directory and the system ACLs instead.",
+            path,
+            actual,
+            mode,
+        )
+        return False
+    return True
 
 
 def validate_profile_name(profile: str) -> str:
