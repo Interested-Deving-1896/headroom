@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
 
+from headroom import fileperms
 from headroom.proxy import request_log_redaction_policy
 from headroom.proxy.models import RequestLog
 
@@ -138,7 +139,12 @@ class RequestLogger:
 
         if self.log_file:
             try:
-                with open(self.log_file, "a") as f:
+                # Owner-only: with ``log_full_messages`` this file holds whole
+                # request and response bodies, and it is the caller's chosen
+                # path rather than one under ~/.headroom, so it must not be
+                # created at the umask. Symlinked paths fail the open and land
+                # in the graceful-degradation branch below.
+                with fileperms.open_owner_only(self.log_file, "a") as f:
                     log_dict = asdict(entry)
                     if not self.log_full_messages:
                         log_dict.pop("request_messages", None)
@@ -165,10 +171,23 @@ class RequestLogger:
             for e in entries
         ]
 
-    def get_recent_with_messages(self, n: int = 20) -> list[dict]:
-        """Get recent log entries including full request/response messages."""
+    def get_recent_with_messages(self, n: int = 20, include_messages: bool = True) -> list[dict]:
+        """Get recent log entries including full request/response messages.
+
+        ``include_messages=False`` returns the same entries without
+        ``request_messages`` / ``compressed_messages`` / ``response_content``,
+        and without walking them: ``asdict`` deep-copies every field, so a
+        caller that only reads the per-request numbers otherwise pays for a
+        full copy of each transcript (~160 KB per Claude Code turn, ~44 MB per
+        ``limit=100`` feed pull) on the event loop.
+        """
         entries = list(self._logs)[-n:]
-        return [asdict(e) for e in entries]
+        if include_messages:
+            return [asdict(e) for e in entries]
+        return [
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
+            for e in entries
+        ]
 
     def stats(self) -> dict:
         """Get logging statistics."""
