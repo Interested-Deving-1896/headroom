@@ -404,14 +404,112 @@ class TestCacheModeSuppressesSteeringOnly:
         settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
         assert resolve_verbosity_level(settings) == (0, "cache_mode")
 
-    def test_cache_mode_outranks_the_manual_level_override(self, monkeypatch):
-        """An env-set level must not reintroduce the prefix mutation."""
+    def test_cache_mode_honours_a_pinned_manual_level(self, monkeypatch):
+        """A level pinned before startup never moves, so it cannot bust a cache.
+
+        The block lands in turn 1's prefix and is byte-identical on every turn
+        after it, so the cached prefix is established WITH it and hits normally.
+        Previously this resolved to 0 and the knob was silently ignored.
+        """
         from headroom.proxy import runtime_env
         from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
 
         monkeypatch.setattr(runtime_env, "getenv", lambda k, d="": "4" if "VERBOSITY" in k else d)
         settings = OutputShaperSettings(enabled=True, verbosity_level=4, steering_enabled=False)
-        assert resolve_verbosity_level(settings)[0] == 0
+        assert resolve_verbosity_level(settings) == (4, "env_pinned")
+
+    def test_cache_mode_still_drops_a_learned_level(self, tmp_path, monkeypatch):
+        """``verbosity.json`` appears the moment someone runs ``learn``."""
+        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+        (tmp_path / "verbosity.json").write_text('{"verbosity_level": 3}')
+
+        settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
+        assert resolve_verbosity_level(settings) == (0, "cache_mode")
+
+    def test_cache_mode_still_drops_a_controller_level(self, tmp_path, monkeypatch):
+        """The AIMD controller rewrites its state file while it hunts."""
+        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        monkeypatch.setenv("HEADROOM_VERBOSITY_AUTOTUNE", "1")
+        monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+        (tmp_path / "verbosity_controller.json").write_text('{"level": 2}')
+
+        settings = OutputShaperSettings(enabled=True, verbosity_level=2, steering_enabled=False)
+        assert resolve_verbosity_level(settings) == (0, "cache_mode")
+
+    def test_a_dropped_level_is_reported_once(self, tmp_path, monkeypatch, caplog):
+        """Silently resolving to 0 is invisible from outside the proxy."""
+        import logging
+
+        from headroom.proxy import output_shaper
+        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+        (tmp_path / "verbosity.json").write_text('{"verbosity_level": 3}')
+        output_shaper._CACHE_MODE_DROPS_REPORTED.clear()
+
+        settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
+        with caplog.at_level(logging.WARNING, logger="headroom.proxy.output_shaper"):
+            resolve_verbosity_level(settings)
+            resolve_verbosity_level(settings)
+
+        warnings = [r for r in caplog.records if "dropped in cache mode" in r.getMessage()]
+        assert len(warnings) == 1, "must not reprint on every request"
+        assert "HEADROOM_VERBOSITY_LEVEL=3" in warnings[0].getMessage()
+
+    def test_pinned_level_keeps_the_system_array_byte_stable_across_turns(self, monkeypatch):
+        """The cache-safety claim, asserted rather than argued.
+
+        Ten turns of a growing conversation must produce a byte-identical
+        ``system`` array -- that identity is the whole reason a pinned level
+        costs no cache.
+        """
+        import json as _json
+
+        from headroom.proxy import runtime_env
+        from headroom.proxy.output_shaper import (
+            OutputShaperSettings,
+            resolve_verbosity_level,
+            shape_request,
+        )
+
+        monkeypatch.setattr(runtime_env, "getenv", lambda k, d="": "2" if "VERBOSITY" in k else d)
+        settings = OutputShaperSettings(enabled=True, verbosity_level=2, steering_enabled=False)
+        level, source = resolve_verbosity_level(settings)
+        assert (level, source) == (2, "env_pinned")
+
+        systems = []
+        messages = []
+        for turn in range(10):
+            messages = messages + [
+                {"role": "user", "content": f"turn {turn}"},
+                {"role": "assistant", "content": "ok"},
+            ]
+            body = {
+                "model": "claude-sonnet-4-5",
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "You are a coding agent.",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": messages,
+            }
+            shape_request(body, settings, level_override=level)
+            systems.append(_json.dumps(body["system"], sort_keys=True))
+
+        assert len(set(systems)) == 1, "steering block must not move between turns"
+        # And the client's own breakpoint is still the FIRST block, so the
+        # prefix it marks is untouched by the appended steering.
+        first = _json.loads(systems[0])
+        assert first[0]["cache_control"] == {"type": "ephemeral"}
+        assert first[-1]["text"].startswith("<headroom_output_shaping>")
 
     def test_effort_routing_survives_cache_mode(self):
         """The savings that do not touch the cache key must still apply."""

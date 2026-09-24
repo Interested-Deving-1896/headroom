@@ -165,37 +165,34 @@ def steering_allowed_for(config: Any) -> bool:
 
     ``mode="cache"`` freezes prior turns specifically to keep the provider's
     prefix-cache key byte-stable (see ``ProxyConfig.mode``). Verbosity steering
-    writes into that key, so running it there trades a large, certain cache
-    cost for a small, uncertain output saving — the wrong side of a roughly
-    60x margin on a long context. Effort routing and the thinking budget are
-    unaffected: they ride request parameters outside the cache key, so they
-    keep saving in cache mode.
+    writes into that key, so a block that CHANGES there trades a large, certain
+    cache cost for a small, uncertain output saving — the wrong side of a
+    roughly 60x margin on a long context. Effort routing and the thinking
+    budget are unaffected: they ride request parameters outside the cache key,
+    so they keep saving in cache mode.
+
+    This is the gate for the sources that can change mid-conversation. It is
+    NOT the last word: :func:`resolve_verbosity_level` lets an explicitly
+    pinned ``HEADROOM_VERBOSITY_LEVEL`` through even here, because a level
+    fixed before startup is written into turn 1's prefix and never moves. See
+    that function for the reasoning.
     """
     return getattr(config, "mode", None) != "cache"
 
 
-def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
-    """Resolve the live verbosity level and its source.
+#: ``(level, source)`` pairs already reported as dropped by cache mode. Keyed so
+#: a level change still speaks up, but a steady state does not reprint on every
+#: request of every conversation.
+_CACHE_MODE_DROPS_REPORTED: set[tuple[int, str]] = set()
 
-    Precedence:
-      1. ``HEADROOM_VERBOSITY_LEVEL`` set explicitly → manual override.
-      2. AIMD controller state (when ``HEADROOM_VERBOSITY_AUTOTUNE`` is on).
-      3. Learned ``verbosity.json`` from ``learn --verbosity``.
-      4. The settings default.
 
-    Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
-    body-mutating core stays a pure function of an explicit level.
+def _resolve_unpinned_level(settings: OutputShaperSettings) -> tuple[int, str]:
+    """Resolve the level from the sources that can move under our feet.
+
+    The controller rewrites its state file as it hunts, and ``verbosity.json``
+    appears the moment someone runs ``learn --verbosity``. Both can therefore
+    change mid-conversation, which is what makes them unsafe in cache mode.
     """
-    if not settings.steering_enabled:
-        # Level 0 is the documented "no steering" value, so this disables the
-        # only cache-key-mutating lever while leaving effort routing on. It
-        # deliberately outranks the manual override below: a level set in the
-        # environment must not reintroduce a prefix mutation the mode exists
-        # to prevent.
-        return 0, "cache_mode"
-    if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
-        return settings.verbosity_level, "env"
-
     try:
         from ..paths import workspace_dir
 
@@ -229,6 +226,71 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
             pass
 
     return settings.verbosity_level, "default"
+
+
+def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
+    """Resolve the live verbosity level and its source.
+
+    Precedence:
+      1. ``HEADROOM_VERBOSITY_LEVEL`` set explicitly → manual override.
+      2. AIMD controller state (when ``HEADROOM_VERBOSITY_AUTOTUNE`` is on).
+      3. Learned ``verbosity.json`` from ``learn --verbosity``.
+      4. The settings default.
+
+    Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
+    body-mutating core stays a pure function of an explicit level.
+
+    Cache mode and the pinned level
+    -------------------------------
+    ``mode="cache"`` used to force this to ``0`` unconditionally, outranking
+    even an explicit ``HEADROOM_VERBOSITY_LEVEL``. That guarded the right
+    hazard with the wrong instrument.
+
+    What costs a prefix cache is the steering block *changing* — appearing on a
+    conversation already in flight, or moving between levels — because the
+    block sits in the ``system`` array, which is inside the cached prefix of
+    every message-level ``cache_control`` breakpoint the client sets. What does
+    NOT cost anything is the block simply *being there*: :func:`shape_request`
+    applies it on every request with no turn-kind gating, and the text is
+    byte-stable per level and idempotent via the sentinel. So a level pinned in
+    the environment before the proxy starts is written into turn 1's prefix and
+    is byte-identical on every turn after it. The cache is established
+    including the block and hits normally from then on; the only cost is the
+    block's own tokens riding along in the cached prefix (~80 at L2, about
+    $0.000024 per turn at Sonnet cache-read rates, against a measured ~700
+    output tokens saved per turn — roughly 450x the other way).
+
+    A pinned level is the one source that cannot move mid-conversation: it is
+    read from the environment and the precedence above already resolves it
+    before the controller and the learned profile are consulted. So it is
+    allowed through in cache mode, reported as ``env_pinned`` so an operator
+    can see steering is running there by explicit request. The controller and
+    learned profile stay banned — those are exactly the sources that rewrite
+    themselves while conversations are open.
+    """
+    if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
+        return settings.verbosity_level, ("env" if settings.steering_enabled else "env_pinned")
+
+    if not settings.steering_enabled:
+        # Level 0 is the documented "no steering" value, so this disables the
+        # only cache-key-mutating lever while leaving effort routing on. Say so
+        # once: a learned or autotuned level silently resolving to 0 is the
+        # shape of bug an operator cannot see from the outside.
+        level, source = _resolve_unpinned_level(settings)
+        if level > 0 and (level, source) not in _CACHE_MODE_DROPS_REPORTED:
+            _CACHE_MODE_DROPS_REPORTED.add((level, source))
+            logger.warning(
+                "OutputShaper: verbosity L%d (%s) dropped in cache mode — that source can "
+                "change mid-conversation and would bust the prefix cache. Set "
+                "HEADROOM_VERBOSITY_LEVEL=%d before starting the proxy to pin it and keep "
+                "steering on.",
+                level,
+                source,
+                level,
+            )
+        return 0, "cache_mode"
+
+    return _resolve_unpinned_level(settings)
 
 
 @dataclass
