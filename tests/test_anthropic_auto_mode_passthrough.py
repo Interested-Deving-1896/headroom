@@ -190,6 +190,37 @@ _MALFORMED_KNOWN_FRAMES = {
     "stop-for-unopened-block": (
         b'event: content_block_stop\ndata: {"type":"content_block_stop","index":9}\n\n'
     ),
+    # ``index`` and ``delta.type`` are provider JSON and may be any JSON value;
+    # a non-scalar one must not reach a dictionary lookup.
+    "object-index-block-start": (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":{"i":1},"content_block":{"type":"text","text":""}}\n\n'
+    ),
+    "object-index-delta": (
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":{"i":0},"delta":{"type":"text_delta","text":"x"}}\n\n'
+    ),
+    "array-index-delta": (
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":[0],"delta":{"type":"text_delta","text":"x"}}\n\n'
+    ),
+    "array-delta-type": (
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":["text_delta"],"text":"x"}}\n\n'
+    ),
+    "non-string-delta-text": (
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":{"t":"x"}}}\n\n'
+    ),
+    "object-index-stop": (
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":{"i":0}}\n\n'
+    ),
+    "array-index-stop": (
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":[0]}\n\n'
+    ),
+    "array-usage-message-delta": (
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":[1]}\n\n'
+    ),
 }
 
 
@@ -227,6 +258,86 @@ data: {"type":"message_stop"}
     assert rendered.count(bad_frame) == 1
     assert rendered.index(b"event: content_block_stop") < rendered.index(bad_frame)
     assert rendered.index(bad_frame) < rendered.rindex(b"event: message_delta")
+
+
+@pytest.mark.parametrize(
+    "bad_frames",
+    [
+        pytest.param(
+            b"event: content_block_delta\n"
+            b'data: {"type":"content_block_delta","index":{"i":0},"delta":{"type":"text_delta","text":"x"}}\n\n'
+            b"event: content_block_delta\n"
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":["text_delta"],"text":"x"}}\n\n',
+            id="delta",
+        ),
+        pytest.param(
+            b"event: content_block_stop\n"
+            b'data: {"type":"content_block_stop","index":{"i":0}}\n\n'
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":[0]}\n\n',
+            id="stop",
+        ),
+    ],
+)
+def test_invalid_discriminators_on_an_open_block_do_not_break_the_stream(
+    bad_frames: bytes,
+) -> None:
+    raw = (
+        b"""event: message_start
+data: {"type":"message_start","message":{"id":"msg_open","type":"message","role":"assistant","content":[]}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}
+
+"""
+        + bad_frames
+        + b"""event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"""
+    )
+
+    envelope = AnthropicSSEEnvelope.parse(raw)
+    rendered = b"".join(envelope.render())
+
+    # The valid frames around the invalid ones still reconstruct the block.
+    assert envelope.message["content"] == [{"type": "text", "text": "hello"}]
+    assert envelope.is_complete()
+    assert not envelope.is_message_reconstructable()
+    assert rendered.count(bad_frames) == 1
+
+
+def test_non_object_message_usage_is_replayed_not_merged() -> None:
+    bad_start = (
+        b"event: message_start\n"
+        b'data: {"type":"message_start","message":{"id":"msg_usage","type":"message",'
+        b'"role":"assistant","content":[],"usage":[12]}}\n\n'
+    )
+    raw = (
+        bad_start
+        + b"""event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"""
+    )
+
+    envelope = AnthropicSSEEnvelope.parse(raw)
+    rendered = b"".join(envelope.render())
+
+    assert not envelope.is_message_reconstructable()
+    assert rendered.count(bad_start) == 1
+    assert envelope.message["usage"] == {"output_tokens": 1}
 
 
 def test_non_stream_response_keeps_unknown_top_level_fields() -> None:

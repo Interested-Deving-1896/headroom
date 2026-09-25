@@ -43,6 +43,12 @@ _DELTA_FIELDS: dict[str, frozenset[str]] = {
     "citations_delta": frozenset({"type", "citation"}),
 }
 _MESSAGE_DELTA_FIELDS = ("stop_reason", "stop_sequence", "stop_details")
+# Delta types whose payload is concatenated onto a string field of the block.
+_STRING_DELTA_FIELDS = {
+    "text_delta": ("text", "text"),
+    "input_json_delta": ("partial_json", "_partial_json"),
+    "thinking_delta": ("thinking", "thinking"),
+}
 _KNOWN_MESSAGE_FIELDS = frozenset(
     {
         "id",
@@ -188,6 +194,20 @@ def _sse_event(payload: dict[str, Any], *, event_name: str | None = None) -> byt
     return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
+def _wire_index(value: Any) -> int | None:
+    """Return a content block index, or None when it is not a valid one.
+
+    ``index`` is provider JSON and may be any JSON value.  Only a non-negative
+    integer identifies a block; anything else (including an unhashable object
+    or array) must leave its frame unreconstructable instead of reaching a
+    dictionary lookup.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _extensions(payload: dict[str, Any], known: Collection[str]) -> dict[str, Any]:
     """Return a copy of the members of ``payload`` this module does not interpret."""
 
@@ -285,7 +305,10 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
         if event_type == "message_start":
             saw_start = True
             message = data.get("message")
-            if isinstance(message, dict):
+            usage = message.get("usage") if isinstance(message, dict) else None
+            # ``usage`` is merged into by later message_delta frames, so a
+            # non-object value would make the message unreconstructable.
+            if isinstance(message, dict) and (usage is None or isinstance(usage, dict)):
                 consumed.add(position)
                 extensions.message_start.update(_extensions(data, _EVENT_FIELDS[event_type]))
                 # Start with the complete upstream message object.  This is
@@ -295,16 +318,20 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
                 # defensive non-empty content array in message_start must not
                 # be duplicated when those blocks are replayed.
                 response["content"] = []
-                response.setdefault("usage", {})
+                if response.get("usage") is None:
+                    response["usage"] = {}
         elif event_type == "content_block_start":
             block = data.get("content_block")
             if not isinstance(block, dict):
                 continue
-            index = data.get("index", len(response["content"]))
-            try:
-                index = int(index)
-            except (TypeError, ValueError):
+            raw_index = data.get("index")
+            if raw_index is None:
                 index = len(response["content"])
+            else:
+                parsed_index = _wire_index(raw_index)
+                if parsed_index is None:
+                    continue
+                index = parsed_index
             current_block = copy.deepcopy(block)
             blocks_by_index[index] = current_block
             block_extensions[id(current_block)] = _BlockExtensions(
@@ -316,11 +343,20 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
             delta = data.get("delta")
             if not isinstance(delta, dict):
                 continue
-            index = data.get("index")
-            target = blocks_by_index.get(index) if index is not None else current_block
-            dtype = delta.get("type")
-            if target is None or dtype not in _DELTA_FIELDS:
+            raw_index = data.get("index")
+            block_index = _wire_index(raw_index)
+            if raw_index is not None and block_index is None:
                 continue
+            target = blocks_by_index.get(block_index) if block_index is not None else current_block
+            dtype = delta.get("type")
+            if target is None or not isinstance(dtype, str) or dtype not in _DELTA_FIELDS:
+                continue
+            if dtype in _STRING_DELTA_FIELDS:
+                source, accumulated = _STRING_DELTA_FIELDS[dtype]
+                if not isinstance(delta.get(source) or "", str) or not isinstance(
+                    target.get(accumulated, ""), str
+                ):
+                    continue
             consumed.add(position)
             event_extensions, delta_extensions = block_extensions[id(target)].deltas.setdefault(
                 dtype, ({}, {})
@@ -343,8 +379,11 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
                 if citation is not None:
                     target.setdefault("citations", []).append(citation)
         elif event_type == "content_block_stop":
-            index = data.get("index")
-            target = blocks_by_index.get(index) if index is not None else current_block
+            raw_index = data.get("index")
+            block_index = _wire_index(raw_index)
+            if raw_index is not None and block_index is None:
+                continue
+            target = blocks_by_index.get(block_index) if block_index is not None else current_block
             if target is None:
                 continue
             consumed.add(position)
@@ -355,22 +394,26 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
                     target["input"] = json.loads(partial) if partial else {}
                 except (TypeError, json.JSONDecodeError):
                     target["input"] = {}
-            key = index if index is not None else id(target)
-            if key not in appended:
+            appended_key = block_index if block_index is not None else id(target)
+            if appended_key not in appended:
                 response["content"].append(target)
-                appended.add(key)
-            if index is not None:
-                open_blocks.discard(index)
+                appended.add(appended_key)
+            if block_index is not None:
+                open_blocks.discard(block_index)
             current_block = None
         elif event_type == "message_delta":
-            consumed.add(position)
             delta = data.get("delta")
+            usage = data.get("usage")
+            if (delta is not None and not isinstance(delta, dict)) or (
+                usage is not None and not isinstance(usage, dict)
+            ):
+                continue
+            consumed.add(position)
             if isinstance(delta, dict):
                 for key in _MESSAGE_DELTA_FIELDS:
                     if key in delta:
                         response[key] = copy.deepcopy(delta[key])
                 extensions.message_delta_delta.update(_extensions(delta, _MESSAGE_DELTA_FIELDS))
-            usage = data.get("usage")
             if isinstance(usage, dict):
                 response.setdefault("usage", {}).update(copy.deepcopy(usage))
                 for key in usage:
