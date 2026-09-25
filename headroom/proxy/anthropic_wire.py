@@ -18,31 +18,31 @@ from __future__ import annotations
 import copy
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from headroom.copilot_auth import build_copilot_upstream_url
 
 _DANGEROUS_TOOL_USE_RE = re.compile(r"(?:^|,)\s*dangerous-tool-use-[^,\s]+", re.IGNORECASE)
-_KNOWN_EVENTS = frozenset(
-    {
-        "message_start",
-        "content_block_start",
-        "content_block_delta",
-        "content_block_stop",
-        "message_delta",
-        "message_stop",
-    }
-)
-_KNOWN_DELTA_TYPES = frozenset(
-    {
-        "text_delta",
-        "input_json_delta",
-        "thinking_delta",
-        "signature_delta",
-        "citations_delta",
-    }
-)
+# Members of each known event (and delta type) that reconstruction interprets.
+# Anything else on a known frame is an extension carried by ``_FrameExtensions``.
+_EVENT_FIELDS: dict[str, frozenset[str]] = {
+    "message_start": frozenset({"type", "message"}),
+    "content_block_start": frozenset({"type", "index", "content_block"}),
+    "content_block_delta": frozenset({"type", "index", "delta"}),
+    "content_block_stop": frozenset({"type", "index"}),
+    "message_delta": frozenset({"type", "delta", "usage"}),
+    "message_stop": frozenset({"type"}),
+}
+_DELTA_FIELDS: dict[str, frozenset[str]] = {
+    "text_delta": frozenset({"type", "text"}),
+    "input_json_delta": frozenset({"type", "partial_json"}),
+    "thinking_delta": frozenset({"type", "thinking"}),
+    "signature_delta": frozenset({"type", "signature"}),
+    "citations_delta": frozenset({"type", "citation"}),
+}
+_MESSAGE_DELTA_FIELDS = ("stop_reason", "stop_sequence", "stop_details")
 _KNOWN_MESSAGE_FIELDS = frozenset(
     {
         "id",
@@ -188,19 +188,89 @@ def _sse_event(payload: dict[str, Any], *, event_name: str | None = None) -> byt
     return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
-def _response_from_events(
-    frames: list[_SSEFrame],
-) -> tuple[dict[str, Any], bool, bool, bool, set[int], set[int]]:
+def _extensions(payload: dict[str, Any], known: Collection[str]) -> dict[str, Any]:
+    """Return a copy of the members of ``payload`` this module does not interpret."""
+
+    return {key: copy.deepcopy(value) for key, value in payload.items() if key not in known}
+
+
+@dataclass
+class _BlockExtensions:
+    """Unknown members carried by one content block's known frames."""
+
+    start: dict[str, Any] = field(default_factory=dict)
+    stop: dict[str, Any] = field(default_factory=dict)
+    # delta type -> (members on the event, members inside its ``delta``)
+    deltas: dict[str, tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=dict)
+
+
+@dataclass
+class _FrameExtensions:
+    """Unknown members of known frames, keyed by the canonical frame they rode on.
+
+    Rendering regenerates known frames from the message dictionary, which has
+    no place for members added to the events themselves.  They are kept here
+    and re-attached to the corresponding regenerated frame instead.
+    """
+
+    message_start: dict[str, Any] = field(default_factory=dict)
+    message_delta: dict[str, Any] = field(default_factory=dict)
+    message_delta_delta: dict[str, Any] = field(default_factory=dict)
+    # ``message_delta.usage`` keys upstream sent; values come from the
+    # rendered response so a CCR continuation reports its own usage.
+    message_delta_usage_keys: list[str] = field(default_factory=list)
+    message_stop: dict[str, Any] = field(default_factory=dict)
+    # Keyed by position in ``message["content"]``, not by wire index.
+    blocks: dict[int, _BlockExtensions] = field(default_factory=dict)
+
+    def for_content(self, original: Any, rendered: Any) -> _FrameExtensions:
+        """Keep block members only where the rendered block is the original one.
+
+        A response transform such as CCR can replace content blocks; members
+        observed on the original block's frames do not describe its
+        replacement.  Message-level members belong to the surrounding protocol
+        and are always kept.
+        """
+
+        before = original if isinstance(original, list) else []
+        after = rendered if isinstance(rendered, list) else []
+        blocks = {
+            position: extensions
+            for position, extensions in self.blocks.items()
+            if position < len(before)
+            and position < len(after)
+            and after[position] == before[position]
+        }
+        return replace(self, blocks=blocks)
+
+
+@dataclass
+class _Reconstruction:
+    message: dict[str, Any]
+    extensions: _FrameExtensions
+    saw_start: bool
+    saw_stop: bool
+    saw_error: bool
+    open_blocks: set[int]
+    # Positions of the frames the message (plus extensions) was built from.
+    consumed: set[int]
+
+
+def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
     """Reconstruct the message and report which frames it was built from.
 
-    The returned ``consumed`` positions are the only frames that
+    The ``consumed`` positions are the only frames that
     :func:`_render_known_response` can regenerate.  Every other frame,
     including a known event whose payload is malformed or does not fit the
     stream's structure, must be replayed verbatim.
     """
 
     response: dict[str, Any] = {"content": [], "usage": {}}
+    extensions = _FrameExtensions()
     blocks_by_index: dict[int, dict[str, Any]] = {}
+    # Keyed by ``id()`` of the block dictionary; the dictionaries stay alive
+    # in ``blocks_by_index`` or ``response["content"]`` for the whole parse.
+    block_extensions: dict[int, _BlockExtensions] = {}
     current_block: dict[str, Any] | None = None
     appended: set[int] = set()
     open_blocks: set[int] = set()
@@ -217,6 +287,7 @@ def _response_from_events(
             message = data.get("message")
             if isinstance(message, dict):
                 consumed.add(position)
+                extensions.message_start.update(_extensions(data, _EVENT_FIELDS[event_type]))
                 # Start with the complete upstream message object.  This is
                 # what preserves future top-level attachments.
                 response.update(copy.deepcopy(message))
@@ -236,6 +307,9 @@ def _response_from_events(
                 index = len(response["content"])
             current_block = copy.deepcopy(block)
             blocks_by_index[index] = current_block
+            block_extensions[id(current_block)] = _BlockExtensions(
+                start=_extensions(data, _EVENT_FIELDS[event_type])
+            )
             open_blocks.add(index)
             consumed.add(position)
         elif event_type == "content_block_delta":
@@ -245,9 +319,14 @@ def _response_from_events(
             index = data.get("index")
             target = blocks_by_index.get(index) if index is not None else current_block
             dtype = delta.get("type")
-            if target is None or dtype not in _KNOWN_DELTA_TYPES:
+            if target is None or dtype not in _DELTA_FIELDS:
                 continue
             consumed.add(position)
+            event_extensions, delta_extensions = block_extensions[id(target)].deltas.setdefault(
+                dtype, ({}, {})
+            )
+            event_extensions.update(_extensions(data, _EVENT_FIELDS[event_type]))
+            delta_extensions.update(_extensions(delta, _DELTA_FIELDS[dtype]))
             if dtype == "text_delta":
                 target["text"] = target.get("text", "") + (delta.get("text") or "")
             elif dtype == "input_json_delta":
@@ -269,6 +348,7 @@ def _response_from_events(
             if target is None:
                 continue
             consumed.add(position)
+            block_extensions[id(target)].stop.update(_extensions(data, _EVENT_FIELDS[event_type]))
             partial = target.pop("_partial_json", None)
             if partial is not None:
                 try:
@@ -286,25 +366,37 @@ def _response_from_events(
             consumed.add(position)
             delta = data.get("delta")
             if isinstance(delta, dict):
-                for key in ("stop_reason", "stop_sequence", "stop_details"):
+                for key in _MESSAGE_DELTA_FIELDS:
                     if key in delta:
                         response[key] = copy.deepcopy(delta[key])
+                extensions.message_delta_delta.update(_extensions(delta, _MESSAGE_DELTA_FIELDS))
             usage = data.get("usage")
             if isinstance(usage, dict):
                 response.setdefault("usage", {}).update(copy.deepcopy(usage))
+                for key in usage:
+                    if key not in extensions.message_delta_usage_keys:
+                        extensions.message_delta_usage_keys.append(key)
             # Some Anthropic additions are attached directly to the delta
             # event rather than nested below ``delta``. Preserve them as
             # response fields without interpreting their schemas.
-            for key, value in data.items():
-                if key not in {"type", "delta", "usage"}:
-                    response[key] = copy.deepcopy(value)
+            event_extensions = _extensions(data, _EVENT_FIELDS[event_type])
+            response.update(copy.deepcopy(event_extensions))
+            extensions.message_delta.update(event_extensions)
         elif event_type == "message_stop":
             saw_stop = True
             consumed.add(position)
+            extensions.message_stop.update(_extensions(data, _EVENT_FIELDS[event_type]))
         elif event_type == "error":
             saw_error = True
 
-    return response, saw_start, saw_stop, saw_error, open_blocks, consumed
+    extensions.blocks = {
+        index: block_extensions[id(block)]
+        for index, block in enumerate(response["content"])
+        if id(block) in block_extensions
+    }
+    return _Reconstruction(
+        response, extensions, saw_start, saw_stop, saw_error, open_blocks, consumed
+    )
 
 
 @dataclass
@@ -315,7 +407,7 @@ class AnthropicSSEEnvelope:
     # (number of reconstructed frames before it, raw bytes) for every frame
     # that the reconstructed message cannot regenerate.
     _opaque_frames: list[tuple[int, bytes]]
-    _message_delta_extras: dict[str, Any]
+    _extensions: _FrameExtensions
     saw_message_start: bool
     saw_message_stop: bool
     saw_error: bool
@@ -335,9 +427,7 @@ class AnthropicSSEEnvelope:
         """
 
         frames = [_SSEFrame(raw, *_json_payload(raw)) for raw in _split_frames(raw_sse_bytes)]
-        message, saw_start, saw_stop, saw_error, open_blocks, consumed = _response_from_events(
-            frames
-        )
+        reconstruction = _response_from_events(frames)
 
         # Anything the reconstruction did not consume is replayed verbatim.
         # A recognized event name is not enough: a known frame with malformed
@@ -347,28 +437,22 @@ class AnthropicSSEEnvelope:
         known_count = 0
         saw_unreconstructable_frame = False
         for position, frame in enumerate(frames):
-            if position in consumed:
+            if position in reconstruction.consumed:
                 known_count += 1
                 continue
-            if frame.event_type in _KNOWN_EVENTS:
+            if frame.event_type in _EVENT_FIELDS:
                 saw_unreconstructable_frame = True
             opaque_frames.append((known_count, frame.raw))
 
-        delta_extras: dict[str, Any] = {}
-        for frame in frames:
-            if frame.event_type == "message_delta" and isinstance(frame.payload, dict):
-                for key, value in frame.payload.items():
-                    if key not in {"type", "delta", "usage"}:
-                        delta_extras[key] = copy.deepcopy(value)
         return cls(
-            message,
+            reconstruction.message,
             opaque_frames,
-            delta_extras,
-            saw_start,
-            saw_stop,
-            saw_error,
+            reconstruction.extensions,
+            reconstruction.saw_start,
+            reconstruction.saw_stop,
+            reconstruction.saw_error,
             saw_unreconstructable_frame,
-            open_blocks,
+            reconstruction.open_blocks,
         )
 
     @classmethod
@@ -400,7 +484,10 @@ class AnthropicSSEEnvelope:
             self.message,
             message if isinstance(message, dict) else self.message,
         )
-        standard = _render_known_response(response, self._message_delta_extras)
+        extensions = self._extensions.for_content(
+            self.message.get("content"), response.get("content")
+        )
+        standard = _render_known_response(response, extensions)
         if self._opaque_frames:
             by_anchor: dict[int, list[bytes]] = {}
             for known_before, raw in self._opaque_frames:
@@ -414,9 +501,22 @@ class AnthropicSSEEnvelope:
         return standard
 
 
+def _block_delta(index: int, delta: dict[str, Any], extensions: _BlockExtensions) -> bytes:
+    event_extensions, delta_extensions = extensions.deltas.get(delta["type"], ({}, {}))
+    return _sse_event(
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {**delta, **copy.deepcopy(delta_extensions)},
+            **copy.deepcopy(event_extensions),
+        }
+    )
+
+
 def _render_known_response(
-    response: dict[str, Any], message_delta_extras: dict[str, Any] | None = None
+    response: dict[str, Any], extensions: _FrameExtensions | None = None
 ) -> list[bytes]:
+    ext = extensions if extensions is not None else _FrameExtensions()
     message = copy.deepcopy(response)
     content = message.pop("content", [])
     raw_usage = message.get("usage")
@@ -427,96 +527,98 @@ def _render_known_response(
     msg_start_message.setdefault("content", [])
     msg_start_message.setdefault("stop_reason", None)
     msg_start_message["usage"] = usage
-    events = [_sse_event({"type": "message_start", "message": msg_start_message})]
+    events = [
+        _sse_event(
+            {
+                "type": "message_start",
+                "message": msg_start_message,
+                **copy.deepcopy(ext.message_start),
+            }
+        )
+    ]
 
     if isinstance(content, list):
         for index, block in enumerate(content):
             if not isinstance(block, dict):
                 continue
+            block_ext = ext.blocks.get(index, _BlockExtensions())
             block_type = block.get("type")
             start_block = copy.deepcopy(block)
             if block_type == "text":
                 start_block["text"] = ""
                 start_block.pop("citations", None)
-            elif block_type in {"tool_use", "server_tool_use"}:
+            elif block_type == "tool_use":
                 start_block["input"] = {}
             elif block_type == "thinking":
                 start_block["thinking"] = ""
-            start = {"type": "content_block_start", "index": index, "content_block": start_block}
-            events.append(_sse_event(start))
+            # Any other block, including ``server_tool_use``, is emitted
+            # complete in its start frame: its input is not streamed.
+            events.append(
+                _sse_event(
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": start_block,
+                        **copy.deepcopy(block_ext.start),
+                    }
+                )
+            )
             if block_type == "text" and block.get("text"):
                 events.append(
-                    _sse_event(
-                        {
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {"type": "text_delta", "text": block["text"]},
-                        }
-                    )
+                    _block_delta(index, {"type": "text_delta", "text": block["text"]}, block_ext)
                 )
                 for citation in block.get("citations", []) or []:
                     events.append(
-                        _sse_event(
-                            {
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {"type": "citations_delta", "citation": citation},
-                            }
+                        _block_delta(
+                            index, {"type": "citations_delta", "citation": citation}, block_ext
                         )
                     )
-            elif block_type in {"tool_use", "server_tool_use"} and "input" in block:
+            elif block_type == "tool_use" and "input" in block:
+                partial_json = json.dumps(block.get("input") or {}, ensure_ascii=False)
                 events.append(
-                    _sse_event(
-                        {
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps(
-                                    block.get("input") or {}, ensure_ascii=False
-                                ),
-                            },
-                        }
+                    _block_delta(
+                        index, {"type": "input_json_delta", "partial_json": partial_json}, block_ext
                     )
                 )
             elif block_type == "thinking":
                 if block.get("thinking"):
                     events.append(
-                        _sse_event(
-                            {
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {"type": "thinking_delta", "thinking": block["thinking"]},
-                            }
+                        _block_delta(
+                            index,
+                            {"type": "thinking_delta", "thinking": block["thinking"]},
+                            block_ext,
                         )
                     )
                 if block.get("signature"):
                     events.append(
-                        _sse_event(
-                            {
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {
-                                    "type": "signature_delta",
-                                    "signature": block["signature"],
-                                },
-                            }
+                        _block_delta(
+                            index,
+                            {"type": "signature_delta", "signature": block["signature"]},
+                            block_ext,
                         )
                     )
-            events.append(_sse_event({"type": "content_block_stop", "index": index}))
+            events.append(
+                _sse_event(
+                    {
+                        "type": "content_block_stop",
+                        "index": index,
+                        **copy.deepcopy(block_ext.stop),
+                    }
+                )
+            )
 
-    delta: dict[str, Any] = {
-        "type": "message_delta",
-        "delta": {},
-        "usage": {"output_tokens": usage.get("output_tokens", 0)},
-    }
-    for key in ("stop_reason", "stop_sequence", "stop_details"):
+    delta_usage = {"output_tokens": usage.get("output_tokens", 0)}
+    for key in ext.message_delta_usage_keys:
+        if key in usage:
+            delta_usage[key] = copy.deepcopy(usage[key])
+    delta: dict[str, Any] = {"type": "message_delta", "delta": {}, "usage": delta_usage}
+    for key in _MESSAGE_DELTA_FIELDS:
         if key in response:
             delta["delta"][key] = response[key]
-    if message_delta_extras:
-        delta.update(copy.deepcopy(message_delta_extras))
+    delta["delta"].update(copy.deepcopy(ext.message_delta_delta))
+    delta.update(copy.deepcopy(ext.message_delta))
     events.append(_sse_event(delta))
-    events.append(_sse_event({"type": "message_stop"}))
+    events.append(_sse_event({"type": "message_stop", **copy.deepcopy(ext.message_stop)}))
     return events
 
 

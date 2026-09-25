@@ -72,6 +72,61 @@ def test_sse_round_trip_keeps_results_across_a_ccr_continuation() -> None:
     assert b"msg_continuation_001" in rendered
 
 
+def _rendered_events(chunks: list[bytes]) -> list[dict]:
+    return [
+        json.loads(line[len("data: ") :])
+        for line in b"".join(chunks).decode("utf-8").splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def test_nested_extensions_on_known_frames_survive_round_trip() -> None:
+    envelope = AnthropicSSEEnvelope.parse(_fixture("claude_code_auto_mode_nested_extensions.sse"))
+    events = {event["type"]: event for event in _rendered_events(envelope.render())}
+
+    assert envelope.is_message_reconstructable()
+    assert events["message_start"]["x_message_start"] == {"sentinel": "message_start"}
+    assert events["content_block_start"]["x_block_start"] == {"sentinel": "block_start"}
+    assert events["content_block_delta"]["x_delta_event"] == {"sentinel": "delta_event"}
+    assert events["content_block_delta"]["delta"] == {
+        "type": "text_delta",
+        "text": "Checking.",
+        "x_text_delta": {"sentinel": "text_delta"},
+    }
+    assert events["content_block_stop"]["x_block_stop"] == {"sentinel": "block_stop"}
+    assert events["message_delta"]["delta"]["x_message_delta_delta"] == {
+        "sentinel": "message_delta_delta"
+    }
+    assert events["message_delta"]["usage"]["cache_read_input_tokens"] == 7
+    assert events["message_delta"]["usage"]["x_usage"] == {"sentinel": "usage"}
+    assert events["message_stop"]["x_message_stop"] == {"sentinel": "message_stop"}
+
+
+def test_block_extensions_do_not_attach_to_replacement_blocks() -> None:
+    envelope = AnthropicSSEEnvelope.parse(_fixture("claude_code_auto_mode_nested_extensions.sse"))
+    continuation = {
+        "id": "msg_continuation_002",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test-20260924",
+        "content": [{"type": "text", "text": "retrieval complete"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 20, "output_tokens": 4},
+    }
+
+    rendered = b"".join(envelope.render(continuation))
+    events = {event["type"]: event for event in _rendered_events([rendered])}
+
+    # Message-level members belong to the protocol and survive the swap.
+    assert events["message_start"]["x_message_start"] == {"sentinel": "message_start"}
+    assert "x_message_delta_delta" in events["message_delta"]["delta"]
+    assert events["message_stop"]["x_message_stop"] == {"sentinel": "message_stop"}
+    # Members of the replaced block's frames do not describe the new block.
+    for sentinel in (b"x_block_start", b"x_delta_event", b"x_text_delta", b"x_block_stop"):
+        assert sentinel not in rendered
+    assert b"retrieval complete" in rendered
+
+
 def test_unknown_content_delta_is_complete_and_replayed_verbatim() -> None:
     raw = b"""event: message_start
 data: {"type":"message_start","message":{"id":"msg_future","type":"message","role":"assistant","content":[]}}
