@@ -203,9 +203,9 @@ def _wire_index(value: Any) -> int | None:
     dictionary lookup.
     """
 
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return int(value)
+    return None
 
 
 def _extensions(payload: dict[str, Any], known: Collection[str]) -> dict[str, Any]:
