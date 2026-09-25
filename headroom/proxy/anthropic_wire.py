@@ -3,8 +3,10 @@
 The proxy is allowed to understand the message content it optimizes, but it
 must not need to understand every field Anthropic adds to the surrounding
 protocol.  This module keeps that distinction explicit: known message events
-are reconstructed into a normal response dictionary, while unknown SSE frames
-are retained as opaque bytes and replayed by :meth:`AnthropicSSEEnvelope.render`.
+are reconstructed into a normal response dictionary, while every SSE frame the
+reconstruction cannot use (unknown events, and known events whose bytes or
+payload are malformed) is retained as opaque bytes and replayed by
+:meth:`AnthropicSSEEnvelope.render`.
 
 The opaque data is deliberately kept out of the provider JSON.  It is an
 internal rendering detail and can therefore never accidentally be serialized
@@ -58,12 +60,11 @@ _KNOWN_MESSAGE_FIELDS = frozenset(
 
 @dataclass(frozen=True)
 class _SSEFrame:
-    """One raw SSE frame and its position among recognized message frames."""
+    """One raw SSE frame and its decoded payload, when it has one."""
 
     raw: bytes
     event_type: str
     payload: dict[str, Any] | None
-    known_before: int
 
 
 def build_anthropic_upstream_url(base_url: str, path: str, raw_query: str = "") -> str:
@@ -189,15 +190,24 @@ def _sse_event(payload: dict[str, Any], *, event_name: str | None = None) -> byt
 
 def _response_from_events(
     frames: list[_SSEFrame],
-) -> tuple[dict[str, Any], bool, bool, bool, set[int]]:
+) -> tuple[dict[str, Any], bool, bool, bool, set[int], set[int]]:
+    """Reconstruct the message and report which frames it was built from.
+
+    The returned ``consumed`` positions are the only frames that
+    :func:`_render_known_response` can regenerate.  Every other frame,
+    including a known event whose payload is malformed or does not fit the
+    stream's structure, must be replayed verbatim.
+    """
+
     response: dict[str, Any] = {"content": [], "usage": {}}
     blocks_by_index: dict[int, dict[str, Any]] = {}
     current_block: dict[str, Any] | None = None
     appended: set[int] = set()
     open_blocks: set[int] = set()
+    consumed: set[int] = set()
     saw_start = saw_stop = saw_error = False
 
-    for frame in frames:
+    for position, frame in enumerate(frames):
         data = frame.payload
         event_type = frame.event_type
         if data is None:
@@ -206,6 +216,7 @@ def _response_from_events(
             saw_start = True
             message = data.get("message")
             if isinstance(message, dict):
+                consumed.add(position)
                 # Start with the complete upstream message object.  This is
                 # what preserves future top-level attachments.
                 response.update(copy.deepcopy(message))
@@ -226,15 +237,17 @@ def _response_from_events(
             current_block = copy.deepcopy(block)
             blocks_by_index[index] = current_block
             open_blocks.add(index)
+            consumed.add(position)
         elif event_type == "content_block_delta":
             delta = data.get("delta")
             if not isinstance(delta, dict):
                 continue
             index = data.get("index")
             target = blocks_by_index.get(index) if index is not None else current_block
-            if target is None:
-                continue
             dtype = delta.get("type")
+            if target is None or dtype not in _KNOWN_DELTA_TYPES:
+                continue
+            consumed.add(position)
             if dtype == "text_delta":
                 target["text"] = target.get("text", "") + (delta.get("text") or "")
             elif dtype == "input_json_delta":
@@ -255,6 +268,7 @@ def _response_from_events(
             target = blocks_by_index.get(index) if index is not None else current_block
             if target is None:
                 continue
+            consumed.add(position)
             partial = target.pop("_partial_json", None)
             if partial is not None:
                 try:
@@ -269,6 +283,7 @@ def _response_from_events(
                 open_blocks.discard(index)
             current_block = None
         elif event_type == "message_delta":
+            consumed.add(position)
             delta = data.get("delta")
             if isinstance(delta, dict):
                 for key in ("stop_reason", "stop_sequence", "stop_details"):
@@ -285,10 +300,11 @@ def _response_from_events(
                     response[key] = copy.deepcopy(value)
         elif event_type == "message_stop":
             saw_stop = True
+            consumed.add(position)
         elif event_type == "error":
             saw_error = True
 
-    return response, saw_start, saw_stop, saw_error, open_blocks
+    return response, saw_start, saw_stop, saw_error, open_blocks, consumed
 
 
 @dataclass
@@ -296,7 +312,9 @@ class AnthropicSSEEnvelope:
     """Parsed Anthropic response plus opaque frames retained for replay."""
 
     message: dict[str, Any]
-    _frames: list[_SSEFrame]
+    # (number of reconstructed frames before it, raw bytes) for every frame
+    # that the reconstructed message cannot regenerate.
+    _opaque_frames: list[tuple[int, bytes]]
     _message_delta_extras: dict[str, Any]
     saw_message_start: bool
     saw_message_stop: bool
@@ -316,24 +334,26 @@ class AnthropicSSEEnvelope:
             every original frame needed for loss-minimizing replay.
         """
 
-        frames: list[_SSEFrame] = []
+        frames = [_SSEFrame(raw, *_json_payload(raw)) for raw in _split_frames(raw_sse_bytes)]
+        message, saw_start, saw_stop, saw_error, open_blocks, consumed = _response_from_events(
+            frames
+        )
+
+        # Anything the reconstruction did not consume is replayed verbatim.
+        # A recognized event name is not enough: a known frame with malformed
+        # bytes or an unusable payload would otherwise be neither rendered
+        # nor replayed, and would silently disappear from the stream.
+        opaque_frames: list[tuple[int, bytes]] = []
         known_count = 0
         saw_unreconstructable_frame = False
-        for raw in _split_frames(raw_sse_bytes):
-            event_type, payload = _json_payload(raw)
-            is_known = event_type in _KNOWN_EVENTS and payload is not None
-            if event_type in _KNOWN_EVENTS and payload is None:
-                saw_unreconstructable_frame = True
-            if event_type == "content_block_delta":
-                delta = payload.get("delta") if isinstance(payload, dict) else None
-                is_known = isinstance(delta, dict) and delta.get("type") in _KNOWN_DELTA_TYPES
-                if not is_known:
-                    saw_unreconstructable_frame = True
-            frames.append(_SSEFrame(raw, event_type, payload, known_count))
-            if is_known:
+        for position, frame in enumerate(frames):
+            if position in consumed:
                 known_count += 1
+                continue
+            if frame.event_type in _KNOWN_EVENTS:
+                saw_unreconstructable_frame = True
+            opaque_frames.append((known_count, frame.raw))
 
-        message, saw_start, saw_stop, saw_error, open_blocks = _response_from_events(frames)
         delta_extras: dict[str, Any] = {}
         for frame in frames:
             if frame.event_type == "message_delta" and isinstance(frame.payload, dict):
@@ -342,7 +362,7 @@ class AnthropicSSEEnvelope:
                         delta_extras[key] = copy.deepcopy(value)
         return cls(
             message,
-            frames,
+            opaque_frames,
             delta_extras,
             saw_start,
             saw_stop,
@@ -374,30 +394,17 @@ class AnthropicSSEEnvelope:
         return self.is_complete() and not self.saw_unreconstructable_frame
 
     def render(self, message: dict[str, Any] | None = None) -> list[bytes]:
-        """Render a changed message and replay unknown frames at their anchors."""
+        """Render a changed message and replay opaque frames at their anchors."""
 
         response = preserve_opaque_response_fields(
             self.message,
             message if isinstance(message, dict) else self.message,
         )
         standard = _render_known_response(response, self._message_delta_extras)
-        opaque = [
-            frame
-            for frame in self._frames
-            if frame.event_type not in _KNOWN_EVENTS
-            or (
-                frame.event_type == "content_block_delta"
-                and not (
-                    isinstance(frame.payload, dict)
-                    and isinstance(frame.payload.get("delta"), dict)
-                    and frame.payload["delta"].get("type") in _KNOWN_DELTA_TYPES
-                )
-            )
-        ]
-        if opaque:
+        if self._opaque_frames:
             by_anchor: dict[int, list[bytes]] = {}
-            for frame in opaque:
-                by_anchor.setdefault(min(frame.known_before, len(standard)), []).append(frame.raw)
+            for known_before, raw in self._opaque_frames:
+                by_anchor.setdefault(min(known_before, len(standard)), []).append(raw)
             out: list[bytes] = []
             for index in range(len(standard) + 1):
                 out.extend(by_anchor.get(index, []))

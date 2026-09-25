@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from headroom.proxy.anthropic_wire import (
@@ -115,6 +116,62 @@ data: {"type":"message_stop"}
     assert not envelope.is_message_reconstructable()
     assert b"\xff" in rendered
     assert b"\xef\xbf\xbd" not in rendered
+
+
+_MALFORMED_KNOWN_FRAMES = {
+    "invalid-json-message-delta": b"event: message_delta\ndata: {not-json\n\n",
+    "invalid-utf8-block-start": (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"\xff"}}\n\n'
+    ),
+    "non-object-content-block": (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":1,"content_block":"future"}\n\n'
+    ),
+    "delta-for-unopened-block": (
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":9,"delta":{"type":"text_delta","text":"x"}}\n\n'
+    ),
+    "stop-for-unopened-block": (
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":9}\n\n'
+    ),
+}
+
+
+@pytest.mark.parametrize("bad_frame", _MALFORMED_KNOWN_FRAMES.values(), ids=_MALFORMED_KNOWN_FRAMES)
+def test_malformed_known_frame_is_replayed_verbatim(bad_frame: bytes) -> None:
+    raw = (
+        b"""event: message_start
+data: {"type":"message_start","message":{"id":"msg_bad_known","type":"message","role":"assistant","content":[]}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"""
+        + bad_frame
+        + b"""event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"""
+    )
+
+    envelope = AnthropicSSEEnvelope.parse(raw)
+    rendered = b"".join(envelope.render())
+
+    assert envelope.is_complete()
+    assert not envelope.is_message_reconstructable()
+    assert rendered.count(bad_frame) == 1
+    assert rendered.index(b"event: content_block_stop") < rendered.index(bad_frame)
+    assert rendered.index(bad_frame) < rendered.rindex(b"event: message_delta")
 
 
 def test_non_stream_response_keeps_unknown_top_level_fields() -> None:
