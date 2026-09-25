@@ -243,7 +243,7 @@ class TestProxyCLITelemetryBanner:
             result = runner.invoke(main, ["proxy", "--no-telemetry"])
 
         assert "Telemetry:" in result.output
-        assert "compression stats" in result.output
+        assert "usage counters" in result.output
         assert "HEADROOM_BEACON=off" in result.output
         # The old banner's bare "DISABLED" claim must not appear on the
         # Telemetry line specifically (the banner has an unrelated
