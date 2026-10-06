@@ -25,9 +25,6 @@
   <a href="llms.txt">llms.txt</a>
 </p>
 
-<p><b>For teams:</b> 3 months of Headroom Enterprise free with a 12-month plan ·
-<a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=top"><b>Claim the perk →</b></a></p>
-
 <sub><b>AI agents / LLMs:</b> read <a href="llms.txt"><code>/llms.txt</code></a> here, or fetch
 <a href="https://docs.headroomlabs.ai/llms.txt">the live index</a> ·
 <a href="https://docs.headroomlabs.ai/llms-full.txt">full docs blob</a>.</sub>
@@ -40,6 +37,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG
 chunks, files, and conversation history — before it reaches the LLM. Same
 answers, fraction of the tokens. Compression runs on your machine; no prompt or
 file content is sent anywhere to be compressed.
+
+<p align="center">
+  <a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=banner"><img src=".github/assets/enterprise-perk.svg" alt="Headroom Enterprise for teams: 3 months free with a 12-month plan. Claim the perk." width="880"></a>
+</p>
 
 <div align="center">
   <img src="HeadroomDemo-Fast.gif" alt="Headroom compressing a 10,144 token log dump to 1,260 tokens while preserving the FATAL line" width="820">
@@ -107,12 +108,6 @@ headroom doctor                         # health check — confirms routing work
 headroom perf
 headroom dashboard                      # live savings (proxy must be running)
 ```
-
-> [!TIP]
-> **Saving tokens on your laptop? Get it across your whole team.** Headroom Enterprise adds
-> tool search, model routing, attack removal and an org-wide savings dashboard.
-> Teams get **3 months free** with a 12-month plan:
-> [claim it here](https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=quickstart).
 
 Inline, in Python:
 
@@ -627,10 +622,6 @@ Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
 [the proxy docs](https://docs.headroomlabs.ai/docs/proxy).
 
 ## Headroom for teams
-
-<p align="center">
-  <a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=teams-card"><img src=".github/assets/enterprise-perk.svg" alt="Headroom Enterprise for teams: 3 months free with a 12-month plan. Claim the perk." width="880"></a>
-</p>
 
 Headroom OSS is built for one developer on one laptop. Headroom Enterprise is built
 for the whole team.
