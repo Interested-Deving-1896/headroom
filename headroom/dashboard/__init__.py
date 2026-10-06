@@ -1,6 +1,8 @@
 """Headroom Dashboard - Real-time proxy monitoring UI."""
 
 import mimetypes
+import os
+import re
 from pathlib import Path
 
 DASHBOARD_DIR = Path(__file__).parent
@@ -49,10 +51,20 @@ def register_static_mime_types() -> None:
         mimetypes.add_type(mime_type, extension)
 
 
+_TEAMS_PERK = re.compile(r"[ \t]*<!-- teams-perk:start.*?<!-- teams-perk:end -->\n?", re.DOTALL)
+
+
 def get_dashboard_html() -> str:
-    """Load the dashboard HTML template."""
+    """Load the dashboard HTML template.
+
+    The Headroom for Teams offer is stripped when ``HEADROOM_LICENSE`` is set:
+    a licensed install is already a customer.
+    """
     template_path = TEMPLATES_DIR / "dashboard.html"
-    return template_path.read_text(encoding="utf-8")
+    html = template_path.read_text(encoding="utf-8")
+    if os.environ.get("HEADROOM_LICENSE"):
+        html = _TEAMS_PERK.sub("", html)
+    return html
 
 
 def get_settings_html() -> str:
