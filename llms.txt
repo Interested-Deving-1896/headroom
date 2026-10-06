@@ -71,4 +71,4 @@ For teams and companies that want Headroom across every developer rather than on
 
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. Anonymous telemetry is **off by default** (opt-in); enable with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`.
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. An anonymous usage beacon is **on by default**: it reports compression ratios, counters, provider and model IDs, OS and architecture, and never prompts, completions, code or file paths. Turn it off with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `--offline`. See [Telemetry](https://github.com/headroomlabs-ai/headroom#telemetry).
