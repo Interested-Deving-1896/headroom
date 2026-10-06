@@ -16,6 +16,7 @@
 
 <p>
   <b><a href="https://docs.headroomlabs.ai/docs/quickstart">Quickstart</a></b> ·
+  <b><a href="#headroom-for-teams">Headroom for Teams</a></b> ·
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility">Agents</a> ·
