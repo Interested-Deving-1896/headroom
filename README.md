@@ -24,8 +24,8 @@
   <a href="llms.txt">llms.txt</a>
 </p>
 
-<p><sub><b>For teams:</b> 3 months of Headroom Enterprise free with a 12-month plan ·
-<a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=top"><b>Claim the perk →</b></a></sub></p>
+<p><b>For teams:</b> 3 months of Headroom Enterprise free with a 12-month plan ·
+<a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=top"><b>Claim the perk →</b></a></p>
 
 <sub><b>AI agents / LLMs:</b> read <a href="llms.txt"><code>/llms.txt</code></a> here, or fetch
 <a href="https://docs.headroomlabs.ai/llms.txt">the live index</a> ·

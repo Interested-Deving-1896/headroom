@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 216" width="880" height="216" role="img"
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 240" width="880" height="240" role="img"
      aria-label="Headroom Enterprise for teams: 3 months free with a 12-month plan. Adds tool search, model routing, attack removal and org-wide savings. Claim the perk.">
   <title>Headroom Enterprise — 3 months free with a 12-month plan</title>
 
@@ -32,11 +32,10 @@
       <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
 
-    <clipPath id="pbtnclip"><rect x="644" y="86" width="196" height="52" rx="26"/></clipPath>
+    <clipPath id="pbtnclip"><rect x="646" y="94" width="208" height="58" rx="29"/></clipPath>
 
     <style>
       .s { font-family: "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif; }
-      .m { font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
 
       /* One light pass over the button per cycle draws the eye to the action. */
       .shine { animation: shine 5s ease-in-out infinite; }
@@ -52,44 +51,46 @@
     </style>
   </defs>
 
-  <!-- Card -->
-  <rect x="1" y="1" width="878" height="214" rx="18" fill="#070A0F"/>
-  <rect x="1" y="1" width="878" height="214" rx="18" fill="url(#pgrid)"/>
-  <rect x="1" y="1" width="878" height="214" rx="18" fill="url(#pglow)"/>
-  <rect x="1" y="1" width="878" height="214" rx="18" fill="none" stroke="url(#pedge)" stroke-width="1.5"/>
+  <!-- Card. One font family, three sizes: 52 headline, 20 lead and button, 16 everything else. -->
+  <rect x="1" y="1" width="878" height="238" rx="18" fill="#070A0F"/>
+  <rect x="1" y="1" width="878" height="238" rx="18" fill="url(#pgrid)"/>
+  <rect x="1" y="1" width="878" height="238" rx="18" fill="url(#pglow)"/>
+  <rect x="1" y="1" width="878" height="238" rx="18" fill="none" stroke="url(#pedge)" stroke-width="1.5"/>
 
-  <!-- Eyebrow -->
-  <circle class="dot" cx="46" cy="44" r="4" fill="#00F0B5"/>
-  <text class="m" x="58" y="48" font-size="12" letter-spacing="2" fill="#00F0B5">HEADROOM ENTERPRISE · FOR TEAMS</text>
+  <g class="s">
+    <!-- Eyebrow -->
+    <circle class="dot" cx="46" cy="47" r="5" fill="#00F0B5"/>
+    <text x="60" y="53" font-size="16" font-weight="600" letter-spacing="1.5" fill="#00F0B5">HEADROOM ENTERPRISE · FOR TEAMS</text>
 
-  <!-- Headline -->
-  <text class="s" x="40" y="104" font-size="44" font-weight="700" fill="#FFFFFF">3 months free</text>
-  <text class="s" x="40" y="134" font-size="16" fill="#98A4B3">with a 12-month plan · one perk per company</text>
+    <!-- Headline -->
+    <text x="40" y="116" font-size="52" font-weight="700" fill="#FFFFFF">3 months free</text>
+    <text x="40" y="152" font-size="20" fill="#98A4B3">with a 12-month plan · one perk per company</text>
 
-  <!-- What Enterprise adds -->
-  <g class="s" font-size="13" fill="#E6EDF3">
-    <rect x="40"  y="160" width="108" height="30" rx="15" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
-    <text x="94"  y="180" text-anchor="middle">Tool search</text>
+    <!-- What Enterprise adds -->
+    <g font-size="16" fill="#E6EDF3">
+      <rect x="40"  y="178" width="118" height="36" rx="18" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
+      <text x="99"  y="202" text-anchor="middle">Tool search</text>
 
-    <rect x="158" y="160" width="122" height="30" rx="15" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
-    <text x="219" y="180" text-anchor="middle">Model routing</text>
+      <rect x="168" y="178" width="134" height="36" rx="18" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
+      <text x="235" y="202" text-anchor="middle">Model routing</text>
 
-    <rect x="290" y="160" width="128" height="30" rx="15" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
-    <text x="354" y="180" text-anchor="middle">Attack removal</text>
+      <rect x="312" y="178" width="140" height="36" rx="18" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
+      <text x="382" y="202" text-anchor="middle">Attack removal</text>
 
-    <rect x="428" y="160" width="150" height="30" rx="15" fill="#0C1118" stroke="#65D8FF" stroke-opacity="0.30"/>
-    <text x="503" y="180" text-anchor="middle">Org-wide savings</text>
+      <rect x="462" y="178" width="156" height="36" rx="18" fill="#0C1118" stroke="#65D8FF" stroke-opacity="0.30"/>
+      <text x="540" y="202" text-anchor="middle">Org-wide savings</text>
+    </g>
+
+    <!-- Divider -->
+    <line x1="634" y1="36" x2="634" y2="204" stroke="#98A4B3" stroke-opacity="0.18"/>
+
+    <!-- Call to action -->
+    <text x="750" y="72" font-size="16" text-anchor="middle" fill="#98A4B3">SSO · VPC or managed</text>
+    <g clip-path="url(#pbtnclip)">
+      <rect x="646" y="94" width="208" height="58" rx="29" fill="url(#pbtn)"/>
+      <rect class="shine" x="646" y="94" width="70" height="58" fill="url(#pshine)"/>
+    </g>
+    <text x="750" y="130" font-size="20" font-weight="700" text-anchor="middle" fill="#070A0F">Claim the perk  →</text>
+    <text x="750" y="190" font-size="16" text-anchor="middle" fill="#98A4B3">headroom-perks.vercel.app</text>
   </g>
-
-  <!-- Divider -->
-  <line x1="612" y1="34" x2="612" y2="182" stroke="#98A4B3" stroke-opacity="0.18"/>
-
-  <!-- Call to action -->
-  <text class="s" x="742" y="66" font-size="13" text-anchor="middle" fill="#98A4B3">SSO · VPC or managed · support</text>
-  <g clip-path="url(#pbtnclip)">
-    <rect x="644" y="86" width="196" height="52" rx="26" fill="url(#pbtn)"/>
-    <rect class="shine" x="644" y="86" width="70" height="52" fill="url(#pshine)"/>
-  </g>
-  <text class="s" x="742" y="118" font-size="17" font-weight="700" text-anchor="middle" fill="#070A0F">Claim the perk  →</text>
-  <text class="m" x="742" y="166" font-size="11" text-anchor="middle" fill="#98A4B3">headroom-perks.vercel.app</text>
 </svg>
