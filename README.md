@@ -627,6 +627,10 @@ Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
 
 ## Headroom for teams
 
+<p align="center">
+  <a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=teams-card"><img src=".github/assets/enterprise-perk.svg" alt="Headroom Enterprise for teams: 3 months free with a 12-month plan. Claim the perk." width="880"></a>
+</p>
+
 Headroom OSS is built for one developer on one laptop. Headroom Enterprise is built
 for the whole team.
 

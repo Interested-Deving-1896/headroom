@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 216" width="880" height="216" role="img"
+     aria-label="Headroom Enterprise for teams: 3 months free with a 12-month plan. Adds tool search, model routing, attack removal and org-wide savings. Claim the perk.">
+  <title>Headroom Enterprise — 3 months free with a 12-month plan</title>
+
+  <defs>
+    <!-- Brand palette as in hero.svg: Mint #00F0B5, Obsidian #070A0F,
+         Midnight #0C1118, Cyan #65D8FF, White, Slate #98A4B3.
+         Dark in both GitHub themes, matching the hero. -->
+    <pattern id="pgrid" width="44" height="44" patternUnits="userSpaceOnUse">
+      <path d="M44 0H0V44" fill="none" stroke="#00F0B5" stroke-opacity="0.05" stroke-width="1"/>
+    </pattern>
+
+    <radialGradient id="pglow" cx="12%" cy="0%" r="80%">
+      <stop offset="0%"   stop-color="#00F0B5" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#00F0B5" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="pedge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#00F0B5" stop-opacity="0.65"/>
+      <stop offset="55%"  stop-color="#65D8FF" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#65D8FF" stop-opacity="0.10"/>
+    </linearGradient>
+
+    <linearGradient id="pbtn" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#00F0B5"/>
+      <stop offset="100%" stop-color="#0FD9AE"/>
+    </linearGradient>
+
+    <linearGradient id="pshine" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="70" y2="0">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="50%"  stop-color="#FFFFFF" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <clipPath id="pbtnclip"><rect x="644" y="86" width="196" height="52" rx="26"/></clipPath>
+
+    <style>
+      .s { font-family: "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif; }
+      .m { font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+
+      /* One light pass over the button per cycle draws the eye to the action. */
+      .shine { animation: shine 5s ease-in-out infinite; }
+      @keyframes shine { 0%, 55% { transform: translateX(-80px) } 85%, 100% { transform: translateX(240px) } }
+
+      .dot { animation: beat 2.4s ease-in-out infinite; }
+      @keyframes beat { 0%, 100% { opacity: 1 } 50% { opacity: .3 } }
+
+      @media (prefers-reduced-motion: reduce) {
+        .shine, .dot { animation: none; }
+        .shine { opacity: 0; }
+      }
+    </style>
+  </defs>
+
+  <!-- Card -->
+  <rect x="1" y="1" width="878" height="214" rx="18" fill="#070A0F"/>
+  <rect x="1" y="1" width="878" height="214" rx="18" fill="url(#pgrid)"/>
+  <rect x="1" y="1" width="878" height="214" rx="18" fill="url(#pglow)"/>
+  <rect x="1" y="1" width="878" height="214" rx="18" fill="none" stroke="url(#pedge)" stroke-width="1.5"/>
+
+  <!-- Eyebrow -->
+  <circle class="dot" cx="46" cy="44" r="4" fill="#00F0B5"/>
+  <text class="m" x="58" y="48" font-size="12" letter-spacing="2" fill="#00F0B5">HEADROOM ENTERPRISE · FOR TEAMS</text>
+
+  <!-- Headline -->
+  <text class="s" x="40" y="104" font-size="44" font-weight="700" fill="#FFFFFF">3 months free</text>
+  <text class="s" x="40" y="134" font-size="16" fill="#98A4B3">with a 12-month plan · one perk per company</text>
+
+  <!-- What Enterprise adds -->
+  <g class="s" font-size="13" fill="#E6EDF3">
+    <rect x="40"  y="160" width="108" height="30" rx="15" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
+    <text x="94"  y="180" text-anchor="middle">Tool search</text>
+
+    <rect x="158" y="160" width="122" height="30" rx="15" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
+    <text x="219" y="180" text-anchor="middle">Model routing</text>
+
+    <rect x="290" y="160" width="128" height="30" rx="15" fill="#0C1118" stroke="#00F0B5" stroke-opacity="0.30"/>
+    <text x="354" y="180" text-anchor="middle">Attack removal</text>
+
+    <rect x="428" y="160" width="150" height="30" rx="15" fill="#0C1118" stroke="#65D8FF" stroke-opacity="0.30"/>
+    <text x="503" y="180" text-anchor="middle">Org-wide savings</text>
+  </g>
+
+  <!-- Divider -->
+  <line x1="612" y1="34" x2="612" y2="182" stroke="#98A4B3" stroke-opacity="0.18"/>
+
+  <!-- Call to action -->
+  <text class="s" x="742" y="66" font-size="13" text-anchor="middle" fill="#98A4B3">SSO · VPC or managed · support</text>
+  <g clip-path="url(#pbtnclip)">
+    <rect x="644" y="86" width="196" height="52" rx="26" fill="url(#pbtn)"/>
+    <rect class="shine" x="644" y="86" width="70" height="52" fill="url(#pshine)"/>
+  </g>
+  <text class="s" x="742" y="118" font-size="17" font-weight="700" text-anchor="middle" fill="#070A0F">Claim the perk  →</text>
+  <text class="m" x="742" y="166" font-size="11" text-anchor="middle" fill="#98A4B3">headroom-perks.vercel.app</text>
+</svg>
