@@ -5074,6 +5074,13 @@ class AnthropicHandlerMixin:
                         _cal_forwarded, _cal_tools, _cal_full = await asyncio.to_thread(
                             local_request_counts, model, body
                         )
+                        # A turn hook that re-drove the model (skill/tool search)
+                        # adds its extra calls' usage to the billed input, but
+                        # the local count is of this one body: billed/local is
+                        # then not this request's exchange rate. Fall back to the
+                        # model's recent rate rather than inflate the saving.
+                        if _hook_usage.extra_calls:
+                            _cal_full = False
                         await self._record_request_outcome(
                             RequestOutcome(
                                 request_id=request_id,

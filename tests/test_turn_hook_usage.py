@@ -403,3 +403,40 @@ def test_anthropic_bills_original_plus_hook_redrive(monkeypatch, _no_hooks) -> N
     assert outcome.cache_read_tokens == 120
     assert outcome.cache_write_tokens == 55
     assert outcome.uncached_input_tokens == 250
+    # Billed input covers two calls but the local count covers one body, so
+    # the turn's billed/local is not an exchange rate: savings calibration
+    # must not measure from it (it falls back to the model's recent rate).
+    assert outcome.local_counts_full_request is False
+
+
+@respx.mock
+def test_anthropic_without_redrive_stays_measurable(monkeypatch, _no_hooks) -> None:
+    """Control for the re-drive case: one call, one body, so the turn's own
+    billed/local exchange rate is valid for savings calibration."""
+    app, outcomes = _app_and_outcomes(monkeypatch)
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "a",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "a"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 100, "output_tokens": 10},
+            },
+        )
+    )
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+    assert result.status_code == 200
+    assert outcomes[-1].local_counts_full_request is True
