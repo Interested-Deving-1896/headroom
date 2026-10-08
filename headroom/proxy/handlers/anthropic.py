@@ -3345,6 +3345,10 @@ class AnthropicHandlerMixin:
             )
 
             _pre_hook_tokens: int | None = None
+            # Tool-definition tokens a turn hook ADDED (e.g. a search tool). Folded
+            # into the forwarded count below so the headline nets them; shrinkage
+            # stays on the turn_hook_tools_saved_tokens tag.
+            _th_tool_growth = 0
             _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
@@ -3387,6 +3391,7 @@ class AnthropicHandlerMixin:
                     else 0
                 )
                 _th_saved = max(0, _th_tok_before - _th_tok_after)
+                _th_tool_growth = max(0, _th_tok_after - _th_tok_before)
                 if _th_saved > 0:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
@@ -3512,6 +3517,8 @@ class AnthropicHandlerMixin:
                 if 0 < _tool_tokens_after < _tool_tokens_before:
                     original_tokens += _tool_tokens_before
                     optimized_tokens += _tool_tokens_after
+                # A tool a turn hook added is sent too: it reduces the saving.
+                optimized_tokens += _th_tool_growth
                 # First-appearance accounting for matured Reads. The client
                 # re-sends the raw conversation every turn, so this diff would
                 # otherwise re-book a matured Read's removal on every request

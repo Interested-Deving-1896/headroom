@@ -221,20 +221,24 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
             if ctx.count_tools is not None:
                 before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
+            # Signed deltas, netted: a hook that folds messages but ADDS a tool
+            # (skill search's ``search_skills``) saved the difference, not the
+            # fold alone. Booked only when the net is a saving.
             message_saved = (
-                max(0, before_messages - ctx.count_messages(ctx.messages))
+                before_messages - ctx.count_messages(ctx.messages)
                 if before_messages is not None and ctx.count_messages is not None
                 else 0
             )
             tool_saved = (
-                max(0, before_tools - ctx.count_tools(without_deferral_flags(ctx.tools)))
+                before_tools - ctx.count_tools(without_deferral_flags(ctx.tools))
                 if before_tools is not None and ctx.count_tools is not None
                 else 0
             )
-            if message_saved or tool_saved:
+            net_saved = message_saved + tool_saved
+            if net_saved > 0:
                 ctx.record_savings(
                     getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
-                    tokens=message_saved + tool_saved,
+                    tokens=net_saved,
                     details={
                         "message_tokens_saved": message_saved,
                         "tool_tokens_saved": tool_saved,

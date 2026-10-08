@@ -4878,6 +4878,15 @@ class OpenAIHandlerMixin:
                 optimized_tokens = _th_msg_after
                 if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
                     optimized_tokens += tool_tokens_after_compaction
+                # A tool the hook added is sent too: it reduces the saving.
+                _th_tools_after_count = (
+                    tokenizer.count_text(
+                        json.dumps(without_deferral_flags(_th_ctx.tools), default=str)
+                    )
+                    if _th_ctx.tools
+                    else 0
+                )
+                optimized_tokens += max(0, _th_tools_after_count - _th_tok_before)
                 tokens_saved = max(0, original_tokens - optimized_tokens)
                 # Attribute to the hook ONLY when the hook itself reduced tokens.
                 if _th_msg_before is not None and _th_msg_after < _th_msg_before:

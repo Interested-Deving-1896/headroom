@@ -1,0 +1,202 @@
+"""A turn hook that folds messages but ADDS a tool saved the difference.
+
+headroom-skill-search rewrites the skill list in the messages and appends a
+``search_skills`` tool. The runner used to clamp the message and tool halves
+separately, so the added tool never reduced the booked saving, and the
+handlers left it out of the forwarded count, so the headline overstated too.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import httpx
+import pytest
+import respx
+
+from headroom.proxy.savings_attribution import from_tags
+from headroom.proxy.turn_hooks import (
+    TurnContext,
+    clear_turn_hooks,
+    register_turn_hook,
+    run_request_hooks,
+)
+
+pytest.importorskip("fastapi")
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
+from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.tokenizers import get_tokenizer  # noqa: E402
+
+SEARCH_TOOL = {
+    "name": "search_skills",
+    "description": "Search the skill catalogue by keyword. " * 10,
+    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+}
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry():
+    clear_turn_hooks()
+    yield
+    clear_turn_hooks()
+
+
+class _FoldAndAddTool:
+    """Shaped like SkillSearchHook: shrink a message, append a search tool."""
+
+    name = savings_source = "skill_search"
+    stream_safe = True
+
+    def __init__(self, folded_text: str) -> None:
+        self.folded_text = folded_text
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [{"role": "user", "content": self.folded_text}]
+        ctx.tools = [*(ctx.tools or []), SEARCH_TOOL]
+
+
+def _count(value: Any) -> int:
+    return len(json.dumps(value, default=str)) // 4 if value else 0
+
+
+def _run(hook: Any, text: str) -> TurnContext:
+    register_turn_hook(hook)
+    ctx = TurnContext(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": text}],
+        tools=[],
+        count_messages=_count,
+        count_tools=_count,
+    )
+    run_request_hooks(ctx)
+    return ctx
+
+
+def test_ledger_entry_is_net_of_the_added_tool() -> None:
+    long_text = "skill line\n" * 400
+    ctx = _run(_FoldAndAddTool("short"), long_text)
+    (entry,) = from_tags(ctx.tags)
+    folded = _count([{"role": "user", "content": long_text}]) - _count(
+        [{"role": "user", "content": "short"}]
+    )
+    added = _count([SEARCH_TOOL])
+    assert entry["tokens"] == folded - added
+    assert entry["details"]["tool_tokens_saved"] == -added
+
+
+def test_no_entry_when_the_added_tool_outweighs_the_fold() -> None:
+    ctx = _run(_FoldAndAddTool("short"), "a bit longer than short")
+    assert from_tags(ctx.tags) == []
+
+
+@respx.mock
+def test_anthropic_headline_nets_a_tool_the_hook_added(monkeypatch) -> None:
+    long_text = "skill line number one\n" * 300
+    register_turn_hook(_FoldAndAddTool("short"))
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+    outcomes: list[Any] = []
+
+    async def _spy(_self, outcome, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "a",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 100, "output_tokens": 1},
+            },
+        )
+    )
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": long_text}],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+    assert result.status_code == 200
+    tok = get_tokenizer("claude-sonnet-4-5")
+    folded = tok.count_messages([{"role": "user", "content": long_text}]) - tok.count_messages(
+        [{"role": "user", "content": "short"}]
+    )
+    added = tok.count_text(json.dumps([SEARCH_TOOL], default=str))
+    assert folded > added > 0
+    assert outcomes[-1].tokens_saved == folded - added
+
+
+class _FoldAndAddFunction(_FoldAndAddTool):
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [{"role": "user", "content": self.folded_text}]
+        ctx.tools = [*(ctx.tools or []), {"type": "function", "function": SEARCH_TOOL}]
+
+
+@respx.mock
+def test_openai_chat_headline_nets_a_tool_the_hook_added(monkeypatch) -> None:
+    long_text = "skill line number one\n" * 300
+    register_turn_hook(_FoldAndAddFunction("short"))
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+    outcomes: list[Any] = []
+
+    async def _spy(_self, outcome, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "a",
+                "choices": [
+                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 1},
+            },
+        )
+    )
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": long_text}]},
+            headers={"authorization": "Bearer sk-test"},
+        )
+    assert result.status_code == 200
+    tok = get_tokenizer("gpt-4o")
+    folded = tok.count_messages([{"role": "user", "content": long_text}]) - tok.count_messages(
+        [{"role": "user", "content": "short"}]
+    )
+    added = tok.count_text(json.dumps([{"type": "function", "function": SEARCH_TOOL}], default=str))
+    assert folded > added > 0
+    assert outcomes[-1].tokens_saved == folded - added
