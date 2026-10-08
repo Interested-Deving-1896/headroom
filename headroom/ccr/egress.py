@@ -32,6 +32,19 @@ class CCRMarkerEgressFilter:
     def feed(self, chunk: bytes) -> list[bytes]:
         """Consume an upstream chunk and return complete scrubbed SSE events."""
         self._buffer.extend(chunk)
+        output: list[bytes] = []
+        while True:
+            boundary = _next_event_boundary(self._buffer)
+            if boundary is None:
+                break
+            end, separator_length = boundary
+            if end + separator_length > MAX_CCR_SSE_EVENT_BYTES:
+                self._buffer.clear()
+                raise CCRMarkerEgressOverflow("CCR client-bound SSE event exceeded the event limit")
+            event = bytes(self._buffer[:end])
+            del self._buffer[: end + separator_length]
+            separator = b"\r\n\r\n" if separator_length == 4 else b"\n\n"
+            output.append(self._scrub_event(event) + separator)
         if len(self._buffer) > MAX_CCR_SSE_EVENT_BYTES:
             size = len(self._buffer)
             self._buffer.clear()
@@ -39,16 +52,6 @@ class CCRMarkerEgressFilter:
                 f"CCR client-bound SSE event exceeded {MAX_CCR_SSE_EVENT_BYTES} bytes "
                 f"without a boundary (received {size})"
             )
-        output: list[bytes] = []
-        while True:
-            boundary = _next_event_boundary(self._buffer)
-            if boundary is None:
-                break
-            end, separator_length = boundary
-            event = bytes(self._buffer[:end])
-            del self._buffer[: end + separator_length]
-            separator = b"\r\n\r\n" if separator_length == 4 else b"\n\n"
-            output.append(self._scrub_event(event) + separator)
         return output
 
     def finish(self) -> list[bytes]:

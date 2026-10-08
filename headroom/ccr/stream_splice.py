@@ -220,17 +220,20 @@ class _SSEEventDecoder:
 
     def feed(self, chunk: bytes) -> list[bytes]:
         self.buffer.extend(chunk)
-        if len(self.buffer) > MAX_CCR_SSE_EVENT_BYTES:
-            self.buffer.clear()
-            raise ValueError("unterminated CCR SSE event exceeded the bounded holdback")
         events: list[bytes] = []
         while True:
             boundary = _next_boundary(self.buffer)
             if boundary is None:
                 break
             end, length = boundary
+            if end + length > MAX_CCR_SSE_EVENT_BYTES:
+                self.buffer.clear()
+                raise ValueError("CCR SSE event exceeded the event limit")
             events.append(bytes(self.buffer[: end + length]))
             del self.buffer[: end + length]
+        if len(self.buffer) > MAX_CCR_SSE_EVENT_BYTES:
+            self.buffer.clear()
+            raise ValueError("unterminated CCR SSE event exceeded the bounded holdback")
         return events
 
     def finish(self) -> list[bytes]:
