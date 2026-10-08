@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -175,6 +175,7 @@ class ContextTracker:
         query_context: str = "",
         sample_content: str = "",
         compression_created_at: float | None = None,
+        current_turn: int | None = None,
     ) -> None:
         """Track a compression event.
 
@@ -192,7 +193,9 @@ class ContextTracker:
             query_context: The user query when compression happened.
             sample_content: Sample of the content for relevance matching.
             compression_created_at: Store event timestamp, allowing replayed
-                history markers to retain their original turn and wall-clock age.
+                history markers to retain their original wall-clock age.
+            current_turn: When supplied, turn_number is the durable first turn
+                in this conversation. Reject stale events before tracking them.
         """
         if not self.config.enabled:
             return
@@ -205,6 +208,17 @@ class ContextTracker:
             return
 
         previous = self._contexts.get(hash_key)
+        # The proxy supplies a durable first turn plus this conversation's
+        # current turn. Reject expired replay before it can occupy capacity,
+        # including after a restart or in-process cache eviction.
+        if current_turn is not None and (
+            max(0, current_turn - turn_number) > self.config.max_turn_distance
+            or (
+                compression_created_at is not None
+                and time.time() - compression_created_at > self.config.max_context_age_seconds
+            )
+        ):
+            return
         if (
             compression_created_at is not None
             and previous is not None
@@ -216,7 +230,13 @@ class ContextTracker:
             # context that the model can still proactively expand.
             if (
                 time.time() - previous.timestamp <= self.config.max_context_age_seconds
-                and max(0, turn_number - previous.turn_number) <= self.config.max_turn_distance
+                and max(
+                    0,
+                    turn_number - previous.turn_number
+                    if current_turn is None
+                    else current_turn - turn_number,
+                )
+                <= self.config.max_turn_distance
             ):
                 self._turn_order.remove(hash_key)
                 self._turn_order.append(hash_key)
@@ -260,6 +280,7 @@ class ContextTracker:
         *,
         workspace_key: str,
         present_hashes: Collection[str] | None = None,
+        compression_turns: Mapping[str, int] | None = None,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
 
@@ -281,6 +302,9 @@ class ContextTracker:
                 compression the requesting conversation never received is
                 another conversation's tool output, not context it lost
                 (#1174). ``None`` skips this filter.
+            compression_turns: Durable first turns for the current conversation.
+                These override cached turns from other conversations sharing a
+                hash. Missing hashes fail closed. None preserves direct callers.
 
         Returns:
             List of expansion recommendations, sorted by relevance.
@@ -315,6 +339,8 @@ class ContextTracker:
                 continue
             if present_hashes is not None and hash_key not in present_hashes:
                 continue
+            if compression_turns is not None and hash_key not in compression_turns:
+                continue
 
             # Check age
             age = now - context.timestamp
@@ -326,7 +352,12 @@ class ContextTracker:
             # therefore an independent staleness boundary.
             turn_distance = 0
             if current_turn is not None:
-                turn_distance = max(0, current_turn - context.turn_number)
+                first_turn = (
+                    context.turn_number
+                    if compression_turns is None
+                    else compression_turns[hash_key]
+                )
+                turn_distance = max(0, current_turn - first_turn)
                 if turn_distance > self.config.max_turn_distance:
                     continue
 

@@ -6,9 +6,15 @@ Data is lost when the process exits.
 
 from __future__ import annotations
 
+import logging
+import math
 import sys
 import threading
+import time
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
+
+from ..context_clock import ContextTurnSnapshot, advance_context_state
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -36,6 +42,36 @@ class InMemoryBackend:
         """Initialize the in-memory backend."""
         self._store: dict[str, CompressionEntry] = {}
         self._lock = threading.Lock()
+        self._context_states: dict[str, tuple[dict[str, Any], float]] = {}
+
+    def observe_context_turn(
+        self, conversation_key: str, hash_keys: Collection[str]
+    ) -> ContextTurnSnapshot | None:
+        with self._lock:
+            now = time.time()
+            events = {
+                key: (entry.created_at, entry.created_at + entry.ttl)
+                for key in set(hash_keys)
+                if (entry := self._store.get(key)) is not None
+                and entry.created_at + entry.ttl >= now
+            }
+            if not events:
+                return None
+            self._context_states = {
+                key: value for key, value in self._context_states.items() if value[1] >= now
+            }
+            prior = self._context_states.get(conversation_key)
+            try:
+                state, snapshot, expires_at = advance_context_state(
+                    None if prior is None else prior[0], events, self._store.keys(), now
+                )
+            except (ValueError, TypeError) as error:
+                logging.getLogger(__name__).warning(
+                    "CCR context clock invalid; proactive expansion skipped: %s", error
+                )
+                return None
+            self._context_states[conversation_key] = (state, expires_at)
+            return snapshot
 
     def get(self, hash_key: str) -> CompressionEntry | None:
         """Retrieve an entry by hash key.
@@ -48,6 +84,14 @@ class InMemoryBackend:
         """
         with self._lock:
             return self._store.get(hash_key)
+
+    def set_new(self, hash_key: str, entry: CompressionEntry) -> None:
+        """Assign a fresh event timestamp under the shared backend lock."""
+        with self._lock:
+            previous = self._store.get(hash_key)
+            if previous is not None and entry.created_at <= previous.created_at:
+                entry.created_at = math.nextafter(previous.created_at, math.inf)
+            self._store[hash_key] = entry
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
         """Store an entry with the given hash key.
@@ -90,6 +134,7 @@ class InMemoryBackend:
         """Remove all entries from storage."""
         with self._lock:
             self._store.clear()
+            self._context_states.clear()
 
     def count(self) -> int:
         """Get the number of entries in storage.

@@ -20,15 +20,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
+from ..context_clock import ContextTurnSnapshot, advance_context_state
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -46,6 +49,12 @@ CREATE INDEX IF NOT EXISTS idx_ccr_expiry_deadline ON ccr_entries (created_at + 
 -- Superseded by idx_ccr_expiry_deadline: no query searches or orders by bare
 -- created_at, so the old index only cost writes. Drop it from existing files.
 DROP INDEX IF EXISTS idx_ccr_expiry;
+CREATE TABLE IF NOT EXISTS ccr_context_states (
+    conversation_key TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ccr_context_expiry ON ccr_context_states(expires_at);
 """
 
 # Purge expired rows at most this often (seconds). Purging is hygiene,
@@ -117,6 +126,7 @@ class SQLiteBackend:
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
             (time.time(),),
         )
+        conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (time.time(),))
         conn.commit()
         # Originals can contain sensitive tool output (file contents,
         # command output) — keep the database private to the user.
@@ -189,6 +199,7 @@ class SQLiteBackend:
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
             (now,),
         )
+        self._conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (now,))
         self._conn.commit()
         self._last_purge = now
         return cursor.rowcount
@@ -209,6 +220,59 @@ class SQLiteBackend:
             return
         self._purge_expired(now)
 
+    def observe_context_turn(
+        self, conversation_key: str, hash_keys: Collection[str]
+    ) -> ContextTurnSnapshot | None:
+        """Persist the counter and event anchors in one cross-worker transaction."""
+        if not hash_keys:
+            return None
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                events = {}
+                for hash_key in set(hash_keys):
+                    row = self._conn.execute(
+                        "SELECT created_at, ttl FROM ccr_entries "
+                        "WHERE hash = ? AND created_at + ttl >= ?",
+                        (hash_key, now),
+                    ).fetchone()
+                    if row is not None:
+                        events[hash_key] = (row[0], row[0] + row[1])
+                if not events:
+                    self._conn.rollback()
+                    return None
+                self._conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (now,))
+                row = self._conn.execute(
+                    "SELECT state_json FROM ccr_context_states WHERE conversation_key = ?",
+                    (conversation_key,),
+                ).fetchone()
+                live_hashes = {
+                    row[0]
+                    for row in self._conn.execute(
+                        "SELECT hash FROM ccr_entries WHERE created_at + ttl >= ?", (now,)
+                    )
+                }
+                state, snapshot, expires_at = advance_context_state(
+                    None if row is None else json.loads(row[0]), events, live_hashes, now
+                )
+                self._conn.execute(
+                    "INSERT INTO ccr_context_states(conversation_key, state_json, expires_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(conversation_key) DO UPDATE SET "
+                    "state_json = excluded.state_json, expires_at = excluded.expires_at",
+                    (conversation_key, json.dumps(state), expires_at),
+                )
+                self._conn.commit()
+                return snapshot
+            except (ValueError, TypeError) as error:
+                self._conn.rollback()
+                logger.warning("CCR context clock invalid; proactive expansion skipped: %s", error)
+                return None
+            except sqlite3.DatabaseError as error:
+                self._conn.rollback()
+                self._handle_db_error(error, "context clock")
+                return None
+
     def get(self, hash_key: str) -> CompressionEntry | None:
         with self._lock:
             try:
@@ -224,9 +288,23 @@ class SQLiteBackend:
         return self._entry_from_json(row[0])
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
-        payload = json.dumps(asdict(entry), ensure_ascii=False)
+        self._set(hash_key, entry, fresh_event=False)
+
+    def set_new(self, hash_key: str, entry: CompressionEntry) -> None:
+        """Assign a fresh event timestamp atomically across SQLite writers."""
+        self._set(hash_key, entry, fresh_event=True)
+
+    def _set(self, hash_key: str, entry: CompressionEntry, *, fresh_event: bool) -> None:
         with self._lock:
             try:
+                if fresh_event:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    previous = self._conn.execute(
+                        "SELECT created_at FROM ccr_entries WHERE hash = ?", (hash_key,)
+                    ).fetchone()
+                    if previous is not None and entry.created_at <= previous[0]:
+                        entry.created_at = math.nextafter(previous[0], math.inf)
+                payload = json.dumps(asdict(entry), ensure_ascii=False)
                 self._conn.execute(
                     "INSERT OR REPLACE INTO ccr_entries "
                     "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
@@ -235,6 +313,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
+                self._conn.rollback()
                 self._handle_db_error(e, "set")
 
     def delete(self, hash_key: str) -> bool:
@@ -266,6 +345,7 @@ class SQLiteBackend:
         with self._lock:
             try:
                 self._conn.execute("DELETE FROM ccr_entries")
+                self._conn.execute("DELETE FROM ccr_context_states")
                 self._conn.commit()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "op")

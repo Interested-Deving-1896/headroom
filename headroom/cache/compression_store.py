@@ -34,14 +34,18 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 from collections import deque
+from collections.abc import Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
+
+from .context_clock import ContextClockBackend, ContextTurnSnapshot
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
@@ -256,6 +260,7 @@ class CompressionStore:
         self._max_entries = max_entries
         self._default_ttl = default_ttl
         self._enable_feedback = enable_feedback
+        self._warned_context_clock_backend = False
 
         # Feedback tracking. maxlen caps the display history, replacing an
         # append-then-reslice that re-copied 1000 pointers on every retrieval.
@@ -421,6 +426,11 @@ class CompressionStore:
             # The CCR mirror bridge re-stores the same explicit_hash on every
             # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
+            if existing is not None and entry.created_at <= existing.created_at:
+                # A coarse clock (or clock rollback) must not give a fresh
+                # same-hash store the old event's identity and turn age.
+                entry.created_at = math.nextafter(existing.created_at, math.inf)
+                expires_at = self._expiration_time(entry)
             if existing is None:
                 self._evict_if_needed()
             else:
@@ -443,7 +453,11 @@ class CompressionStore:
                 # Mark old heap entry as stale since we're replacing it.
                 self._mark_heap_entries_stale()
 
-            self._backend.set(hash_key, entry)
+            # Built-in backends assign fresh event identity under their shared
+            # write lock/transaction; CRUD-only custom backends retain set().
+            set_new = getattr(self._backend, "set_new", self._backend.set)
+            set_new(hash_key, entry)
+            expires_at = self._expiration_time(entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
             heapq.heappush(
@@ -517,6 +531,26 @@ class CompressionStore:
             self.process_pending_feedback()
 
         return result_entry
+
+    def observe_context_turn(
+        self, conversation_key: str, hash_keys: Collection[str]
+    ) -> ContextTurnSnapshot | None:
+        """Observe one request using backend-scoped, durable event turns.
+
+        Built-in memory/SQLite backends share this capability. A custom backend
+        without it retains explicit retrieval but cannot safely authorize
+        proactive expansion from an unverified conversation clock.
+        """
+        if not isinstance(self._backend, ContextClockBackend):
+            if not self._warned_context_clock_backend:
+                logger.warning(
+                    "CCR backend lacks conversation clocks; proactive expansion skipped. "
+                    "Explicit retrieval remains available."
+                )
+                self._warned_context_clock_backend = True
+            return None
+        with self._lock:
+            return self._backend.observe_context_turn(conversation_key, hash_keys)
 
     def get_metadata(
         self,
