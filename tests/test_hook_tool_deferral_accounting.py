@@ -265,3 +265,36 @@ def test_anthropic_headline_drops_the_credit_of_a_tool_a_hook_undefers(monkeypat
     assert tags["tool_search_deferred_tokens"] == tok.count_text(json.dumps(still, default=str))
     (entry,) = [e for e in from_tags(tags) if e["source"] == "tool_search"]
     assert entry["tokens"] == tags["tool_search_deferred_tokens"]
+
+
+class _ShrinkSecondUndeferFirst:
+    """A tool_search-sourced hook: shortens b (still deferred), un-defers a."""
+
+    name = savings_source = "tool_search"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools[0].pop("defer_loading", None)
+        ctx.tools[1]["description"] = "short"
+
+
+def test_release_debits_the_deferral_entry_not_a_hooks_own_saving() -> None:
+    tags, entries = _booked(_BookDeferral(), _ShrinkSecondUndeferFirst())
+    deferral = [e for e in entries if e.get("estimated")]
+    measured = [e for e in entries if not e.get("estimated")]
+    (deferral_entry,) = deferral
+    (hook_entry,) = measured
+    shrunk = {**_tool("b"), "description": "short"}
+    # The hook keeps its own measured saving (b's shrink, flags ignored)...
+    assert hook_entry["tokens"] == _count([_tool("a"), _tool("b")]) - _count([_tool("a"), shrunk])
+    # ...and only the deferral entry is debited, down to what is still deferred.
+    assert deferral_entry["tokens"] == tags["tool_search_deferred_tokens"]
+
+
+def test_a_shortened_deferred_schema_is_credited_once() -> None:
+    # b's shrink is the hook's saving; the deferral credits b at its final
+    # (smaller) size, so those tokens are not counted twice.
+    tags, _ = _booked(_BookDeferral(), _ShrinkSecondUndeferFirst())
+    shrunk = {**_tool("b"), "description": "short", "defer_loading": True}
+    assert tags["tool_search_deferred_tokens"] == _count([shrunk])
+    assert tags["tool_search_deferred_tools"] == 1

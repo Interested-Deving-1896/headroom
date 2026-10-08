@@ -51,11 +51,18 @@ def without_deferral_flags(tools: object) -> object:
     ]
 
 
-def deferred_booking(tags: object, tools: object) -> tuple[int, dict[str, Any]] | None:
-    """Snapshot the deferral currently booked: the tag and the tools it covers.
+DeferredBooking = tuple[int, dict[str, Any], "dict[str, Any] | None"]
+
+
+def deferred_booking(tags: object, tools: object) -> DeferredBooking | None:
+    """Snapshot the deferral currently booked: the tag, the tools it covers and
+    its own ledger entry.
 
     ``None`` when nothing is booked. The schemas are copied as they were when
     booked, so a later in-place edit cannot change what the credit stands for.
+    The ledger entry is the latest ``tool_search`` one marked ``estimated``:
+    both the core deferral and the native deferral hook book that way, and a
+    hook's own measured saving never is, so it is never the one debited.
     """
     if not isinstance(tags, dict) or "tool_search_deferred_tokens" not in tags:
         return None
@@ -68,44 +75,59 @@ def deferred_booking(tags: object, tools: object) -> tuple[int, dict[str, Any]] 
         for t in (tools if isinstance(tools, list) else [])
         if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
     }
-    return booked, snapshot
+    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+
+    ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
+    entry = next(
+        (
+            item
+            for item in reversed(ledger if isinstance(ledger, list) else [])
+            if isinstance(item, dict)
+            and item.get("source") == "tool_search"
+            and item.get("estimated")
+        ),
+        None,
+    )
+    return booked, snapshot, entry
 
 
 def reconcile_deferred_tokens(
-    tags: object, booking: tuple[int, dict[str, Any]] | None, tools: object, count_tools: object
+    tags: object, booking: DeferredBooking | None, tools: object, count_tools: object
 ) -> None:
     """Cap the deferral credit at the booked tools still deferred after hooks.
 
     A hook may un-defer tools the deferral booked (tool search's hot tools);
-    those are billed, so their share of the credit goes. The remaining share is
-    recounted from the BOOKED schemas, so a hook that grows another deferred
-    schema cannot keep an un-deferred tool's credit alive. Only ever lowers the
-    tag, and lowers the matching ``tool_search`` ledger entry by the same
-    amount so ``/stats`` by-source agrees with the headline. Never raises.
+    those are billed, so their share of the credit goes. Each tool still
+    deferred is credited at the SMALLER of its booked and its final schema:
+    growing another schema cannot keep an un-deferred tool's credit alive, and
+    a schema a hook shortened (and booked as its own saving) is not credited
+    twice. Only ever lowers the tag, and lowers the deferral's own ledger entry
+    by the same amount so ``/stats`` by-source agrees with the headline.
+    Never raises.
     """
     if booking is None or not isinstance(tags, dict) or not callable(count_tools):
         return
-    booked, snapshot = booking
+    booked, snapshot, entry = booking
     try:
-        still = {
-            str(t["name"])
+        final = {
+            str(t["name"]): t
             for t in (tools if isinstance(tools, list) else [])
             if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
         }
-        kept = [schema for name, schema in snapshot.items() if name in still]
+        kept = []
+        for name, schema in snapshot.items():
+            if name not in final:
+                continue
+            now = final[name]
+            kept.append(now if int(count_tools([now])) < int(count_tools([schema])) else schema)
         measured = int(count_tools(kept)) if kept else 0
         released = booked - measured
         if released <= 0:
             return
         tags["tool_search_deferred_tokens"] = measured
         tags["tool_search_deferred_tools"] = len(kept)
-        from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
-
-        ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
-        for item in reversed(ledger if isinstance(ledger, list) else []):
-            if isinstance(item, dict) and item.get("source") == "tool_search":
-                item["tokens"] = max(0, int(item.get("tokens") or 0) - released)
-                break
+        if isinstance(entry, dict):
+            entry["tokens"] = max(0, int(entry.get("tokens") or 0) - released)
     except Exception:  # accounting must never break a request
         return
 
