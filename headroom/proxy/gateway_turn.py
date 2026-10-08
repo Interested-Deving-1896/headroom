@@ -51,7 +51,10 @@ from typing import Any
 
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    reconcile_deferred_tokens,
+    without_deferral_flags,
+)
 from headroom.proxy.turn_hooks import (
     TurnContext,
     merge_provider_headers,
@@ -899,6 +902,8 @@ class RequestTransformer:
             run_request_hooks(ctx, stream_safe_only=not self.caps.redrive_allowed)
             messages = ctx.messages
             tools = ctx.tools
+            # A later hook may un-defer tools an earlier one deferred and booked.
+            reconcile_deferred_tokens(self.tags, tools, count_tools)
             # Provider headers the hooks asked for become the contract's
             # ``headers`` object; the gateway sets them on the provider call.
             headers = merge_provider_headers(self.caps.request_headers, ctx.provider_headers)

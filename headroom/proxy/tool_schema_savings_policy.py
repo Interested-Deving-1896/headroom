@@ -48,6 +48,35 @@ def without_deferral_flags(tools: object) -> object:
     ]
 
 
+def reconcile_deferred_tokens(tags: object, tools: object, count_tools: object) -> None:
+    """Cap the deferral credit at what is still deferred after turn hooks.
+
+    ``tool_search_deferred_tokens`` is booked when tools are flagged
+    ``defer_loading``. A hook that runs afterwards may un-defer some of them
+    (headroom-tool-search's hot tools); those are then billed, so the credit
+    must shrink with them. Re-measured with the same counter that booked it,
+    over the FINAL tool array, and only ever lowered: a hook that defers more
+    books its own tag. Never raises.
+    """
+    if not isinstance(tags, dict) or "tool_search_deferred_tokens" not in tags:
+        return
+    try:
+        booked = int(tags.get("tool_search_deferred_tokens") or 0)
+        still = (
+            [t for t in tools if isinstance(t, dict) and t.get("defer_loading")]
+            if isinstance(tools, list)
+            else []
+        )
+        measured = int(count_tools(still)) if still and callable(count_tools) else 0
+        if measured < booked:
+            tags["tool_search_deferred_tokens"] = measured
+            tags["tool_search_deferred_tools"] = min(
+                int(tags.get("tool_search_deferred_tools") or 0), len(still)
+            )
+    except Exception:  # accounting must never break a request
+        return
+
+
 TOOL_SCHEMA_SAVINGS_TAGS: tuple[str, ...] = (
     "tool_search_deferred_tokens",
     "turn_hook_tools_saved_tokens",
