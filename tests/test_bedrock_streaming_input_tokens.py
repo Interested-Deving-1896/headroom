@@ -150,3 +150,43 @@ def test_bedrock_streaming_preserves_nonzero_upstream_input_tokens() -> None:
     upstream_input_tokens = 777
     body = _post_stream(_make_bedrock_backend(_bedrock_events(input_tokens=upstream_input_tokens)))
     assert _message_start_input_tokens(body) == upstream_input_tokens
+
+
+def _post_stream_stats(backend: MagicMock) -> dict:
+    """Run one streamed turn and return /stats tokens (provenance counters)."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="anthropic",
+    )
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=backend):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [{"role": "user", "content": "hello there general"}],
+                    "max_tokens": 64,
+                    "stream": True,
+                },
+                headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+            )
+            assert resp.status_code == 200, resp.text[:200]
+            return client.get("/stats").json()["tokens"]
+
+
+def test_bedrock_backfilled_input_is_reported_as_estimated() -> None:
+    """The #1132 backfill is Headroom's estimate: it must not count as billed input."""
+    tokens = _post_stream_stats(_make_bedrock_backend(_bedrock_events(input_tokens=0)))
+    assert tokens["input"] > 0
+    assert tokens["input_provider_reported"] == 0
+    assert tokens["input_estimated"] == tokens["input"]
+
+
+def test_bedrock_reported_input_is_provider_reported() -> None:
+    tokens = _post_stream_stats(_make_bedrock_backend(_bedrock_events(input_tokens=777)))
+    assert tokens["input_provider_reported"] == 777
+    assert tokens["input_estimated"] == 0

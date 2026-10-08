@@ -32,6 +32,7 @@ from typing import Any
 
 __all__ = [
     "anthropic_billed_input",
+    "is_anthropic_dialect",
     "billed_input_from_usage",
     "billed_input_for_provider",
 ]
@@ -47,6 +48,18 @@ def _int(value: Any) -> int:
         return max(int(value), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def is_anthropic_dialect(provider: str | None) -> bool:
+    """True for providers whose usage blocks keep cache buckets disjoint.
+
+    Decided by the provider, never by which keys a usage block happens to
+    carry: OpenAI-compatible gateways (LiteLLM among them) mirror top-level
+    ``cache_read_input_tokens`` beside an INCLUSIVE ``input_tokens``, so the
+    keys alone cannot tell the two dialects apart.
+    """
+    name = (provider or "").lower()
+    return name in _ANTHROPIC_SHAPE or "anthropic" in name
 
 
 def anthropic_billed_input(input_tokens: Any, cache_read: Any = 0, cache_write: Any = 0) -> int:
@@ -70,7 +83,7 @@ def billed_input_for_provider(
     """
     if input_tokens is None:
         return 0
-    if (provider or "").lower() in _ANTHROPIC_SHAPE:
+    if is_anthropic_dialect(provider):
         total = anthropic_billed_input(input_tokens, cache_read, cache_write)
         # message_start can carry input_tokens=0 alongside real cache buckets
         # on a fully cached turn; that is still a provider-reported count.
@@ -78,12 +91,13 @@ def billed_input_for_provider(
     return _int(input_tokens)
 
 
-def billed_input_from_usage(payload: Mapping[str, Any] | None) -> int:
+def billed_input_from_usage(payload: Mapping[str, Any] | None, provider: str | None) -> int:
     """Billed input from a raw provider response (or its ``usage`` block).
 
-    Detects the shape from the keys present, so pass-through endpoints that do
-    not know which provider answered still get the right total. Returns 0 when
-    no input count is present.
+    ``provider`` selects the dialect (see ``is_anthropic_dialect``); it is
+    required because the same keys mean different things across dialects.
+    Gemini's ``usageMetadata`` is unambiguous and recognised by shape. Returns
+    0 when no input count is present.
     """
     if not isinstance(payload, Mapping):
         return 0
@@ -99,17 +113,16 @@ def billed_input_from_usage(payload: Mapping[str, Any] | None) -> int:
     if "promptTokenCount" in usage:
         return _int(usage.get("promptTokenCount"))
 
-    # Anthropic shape: top-level disjoint cache buckets beside input_tokens.
-    if "input_tokens" in usage and (
-        "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
-    ):
+    if is_anthropic_dialect(provider):
+        if "input_tokens" not in usage:
+            return 0
         return anthropic_billed_input(
             usage.get("input_tokens"),
             usage.get("cache_read_input_tokens"),
             usage.get("cache_creation_input_tokens"),
         )
 
-    # OpenAI shapes: the headline figure already includes cached tokens.
+    # OpenAI and OpenAI-compatible dialects: the headline figure is inclusive.
     if "prompt_tokens" in usage:
         return _int(usage.get("prompt_tokens"))
     if "input_tokens" in usage:

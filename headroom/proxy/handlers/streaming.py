@@ -2211,6 +2211,9 @@ class StreamingMixin:
                         msg_usage = event.data.setdefault("message", {}).setdefault("usage", {})
                         if not msg_usage.get("input_tokens") and optimized_tokens > 0:
                             msg_usage["input_tokens"] = optimized_tokens
+                            # The client-bound backfill is Headroom's estimate,
+                            # not backend usage: never report it as billed.
+                            stream_state["input_tokens_backfilled"] = True
 
                     # Format as SSE
                     if event.raw_sse:
@@ -2228,6 +2231,8 @@ class StreamingMixin:
                         usage = msg.get("usage", {})
                         if "input_tokens" in usage:
                             stream_state["input_tokens"] = usage["input_tokens"]
+                            if not stream_state.get("input_tokens_backfilled"):
+                                stream_state["backend_input_tokens"] = usage["input_tokens"]
                         stream_state["cache_read_input_tokens"] = usage.get(
                             "cache_read_input_tokens", 0
                         )
@@ -2245,6 +2250,7 @@ class StreamingMixin:
                             stream_state["output_tokens"] = usage["output_tokens"]
                         if "input_tokens" in usage:
                             stream_state["input_tokens"] = usage["input_tokens"]
+                            stream_state["backend_input_tokens"] = usage["input_tokens"]
                         if "cache_read_input_tokens" in usage:
                             stream_state["cache_read_input_tokens"] = usage[
                                 "cache_read_input_tokens"
@@ -2330,8 +2336,10 @@ class StreamingMixin:
                 # doesn't propagate frozen_message_count either — same
                 # fallback as the SSE finalizer (#455).
                 # Bedrock forwards Anthropic-shape usage: input_tokens is the
-                # uncached tail only, cache buckets are disjoint.
-                _bedrock_input = stream_state.get("input_tokens")
+                # uncached tail only, cache buckets are disjoint. Only a count
+                # the backend itself reported qualifies; the message_start
+                # backfill above is Headroom's estimate.
+                _bedrock_input = stream_state.get("backend_input_tokens")
                 outcome = RequestOutcome.from_stream(
                     body=body,
                     provider=_backend_name,

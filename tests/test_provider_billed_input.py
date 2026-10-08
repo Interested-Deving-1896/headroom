@@ -44,10 +44,11 @@ LOCAL_ESTIMATE = 17
 
 
 @pytest.mark.parametrize(
-    "payload,expected",
+    "provider,payload,expected",
     [
         # Anthropic: input_tokens is the uncached tail; cache buckets are disjoint.
         (
+            "anthropic",
             {
                 "usage": {
                     "input_tokens": 19,
@@ -59,23 +60,38 @@ LOCAL_ESTIMATE = 17
         ),
         # OpenAI chat: prompt_tokens already includes cached_tokens.
         (
+            "openai",
             {"usage": {"prompt_tokens": 5_000, "prompt_tokens_details": {"cached_tokens": 4_000}}},
             5_000,
         ),
         # OpenAI Responses: input_tokens already includes cached_tokens.
         (
+            "openai",
             {"usage": {"input_tokens": 5_000, "input_tokens_details": {"cached_tokens": 4_000}}},
             5_000,
         ),
         # Gemini: promptTokenCount includes cachedContentTokenCount.
-        ({"usageMetadata": {"promptTokenCount": 7_000, "cachedContentTokenCount": 6_000}}, 7_000),
+        (
+            "gemini",
+            {"usageMetadata": {"promptTokenCount": 7_000, "cachedContentTokenCount": 6_000}},
+            7_000,
+        ),
+        # OpenAI-compatible gateways (LiteLLM) mirror top-level Anthropic-named
+        # cache keys beside an INCLUSIVE input_tokens. Keys alone must not flip
+        # the dialect, or the cached part is counted twice.
+        ("openai", {"usage": {"input_tokens": 5_000, "cache_read_input_tokens": 4_000}}, 5_000),
+        (
+            "vertex:anthropic",
+            {"usage": {"input_tokens": 50, "cache_read_input_tokens": 4_000}},
+            4_050,
+        ),
         # Nothing reported: 0 means "unknown", never "zero tokens billed".
-        ({"id": "x"}, 0),
-        (None, 0),
+        ("anthropic", {"id": "x"}, 0),
+        ("openai", None, 0),
     ],
 )
-def test_billed_input_from_usage_per_provider_shape(payload, expected) -> None:  # noqa: ANN001
-    assert billed_input_from_usage(payload) == expected
+def test_billed_input_from_usage_per_provider_shape(provider, payload, expected) -> None:  # noqa: ANN001
+    assert billed_input_from_usage(payload, provider) == expected
 
 
 def test_billed_input_for_provider_adds_anthropic_cache_buckets_only() -> None:
@@ -89,7 +105,8 @@ def test_billed_input_for_provider_adds_anthropic_cache_buckets_only() -> None:
 
 def test_passthrough_normaliser_returns_anthropic_total_not_uncached_tail() -> None:
     usage = _passthrough_usage_from_json(
-        {"usage": {"input_tokens": 19, "output_tokens": 14, "cache_read_input_tokens": 8_857}}
+        {"usage": {"input_tokens": 19, "output_tokens": 14, "cache_read_input_tokens": 8_857}},
+        "anthropic",
     )
     # Callers derive uncached as input - read - write, which is only right on the total.
     assert usage["input_tokens"] == ANTHROPIC_BILLED

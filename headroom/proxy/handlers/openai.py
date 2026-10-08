@@ -583,7 +583,7 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
-def _passthrough_usage_from_json(payload: Any) -> dict[str, int]:
+def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> dict[str, int]:
     """Normalize usage from pass-through provider response shapes."""
     if not isinstance(payload, dict):
         return {}
@@ -611,7 +611,7 @@ def _passthrough_usage_from_json(payload: Any) -> dict[str, int]:
             # the uncached tail only (cache buckets are disjoint); OpenAI's
             # headline figure is already inclusive. Callers derive uncached as
             # total - read - write, which is only right on the total.
-            "input_tokens": billed_input_from_usage(usage) or _usage_int(input_tokens),
+            "input_tokens": billed_input_from_usage(usage, provider) or _usage_int(input_tokens),
             "output_tokens": _usage_int(output_tokens),
             "cache_read_input_tokens": _usage_int(usage.get("cache_read_input_tokens", cache_read)),
             "cache_creation_input_tokens": _usage_int(usage.get("cache_creation_input_tokens")),
@@ -11760,7 +11760,7 @@ class OpenAIHandlerMixin:
             usage: dict[str, int] = {}
             if response.headers.get("content-type", "").lower().startswith("application/json"):
                 try:
-                    usage = _passthrough_usage_from_json(response.json())
+                    usage = _passthrough_usage_from_json(response.json(), provider)
                 except (json.JSONDecodeError, ValueError, TypeError):
                     usage = {}
             input_tokens = usage.get("input_tokens", 0)
