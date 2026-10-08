@@ -207,6 +207,11 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     # Deferral booked before or by a hook; reconciled once every hook has run,
     # since a later hook may un-defer booked tools (tool search's hot tools).
     booking = deferred_booking(ctx.tags, ctx.tools)
+    # Positive nets wait until every hook has run: a later hook that grows the
+    # request (adds a tool) offsets earlier savings, so the ledger never credits
+    # more than the whole sequence actually removed.
+    gains: list[tuple[str, int, dict[str, int]]] = []
+    sequence_net = 0
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
@@ -235,14 +240,14 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 else 0
             )
             net_saved = message_saved + tool_saved
+            sequence_net += net_saved
             if net_saved > 0:
-                ctx.record_savings(
-                    getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
-                    tokens=net_saved,
-                    details={
-                        "message_tokens_saved": message_saved,
-                        "tool_tokens_saved": tool_saved,
-                    },
+                gains.append(
+                    (
+                        getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
+                        net_saved,
+                        {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved},
+                    )
                 )
         except Exception:  # a hook must never break the proxy
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
@@ -250,6 +255,18 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
             # This hook booked (or re-booked) the deferral: it is the new baseline.
             booking = deferred_booking(ctx.tags, ctx.tools)
     reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
+    # Book gains in run order up to the sequence's net saving; a loss that
+    # exceeds them all books nothing (never a negative entry).
+    budget = max(0, sequence_net)
+    for source, net_saved, details in gains:
+        tokens = min(net_saved, budget)
+        if tokens <= 0:
+            break
+        budget -= tokens
+        try:
+            ctx.record_savings(source, tokens=tokens, details=details)
+        except Exception:
+            log.exception("turn hook savings for %r not recorded", source)
 
 
 async def run_response_hooks(

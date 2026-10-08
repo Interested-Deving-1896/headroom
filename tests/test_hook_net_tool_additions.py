@@ -200,3 +200,56 @@ def test_openai_chat_headline_nets_a_tool_the_hook_added(monkeypatch) -> None:
     added = tok.count_text(json.dumps([{"type": "function", "function": SEARCH_TOOL}], default=str))
     assert folded > added > 0
     assert outcomes[-1].tokens_saved == folded - added
+
+
+# ── a later hook's loss offsets an earlier hook's gain ───────────────────────
+
+
+class _Fold:
+    name = savings_source = "fold"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [{"role": "user", "content": "x"}]
+
+
+class _AddBigTool:
+    name = savings_source = "adder"
+    stream_safe = True
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools = [*(ctx.tools or []), {"name": "t", "description": "d" * self.size}]
+
+
+def _sequence(*hooks: object) -> tuple[list[dict], int]:
+    for hook in hooks:
+        register_turn_hook(hook)
+    count = lambda v: len(json.dumps(v, default=str)) // 4 if v else 0  # noqa: E731
+    messages = [{"role": "user", "content": "m" * 800}]
+    ctx = TurnContext(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        messages=messages,
+        tools=[],
+        count_messages=count,
+        count_tools=count,
+    )
+    before = count(messages)
+    run_request_hooks(ctx)
+    net = before - count(ctx.messages) - count(ctx.tools)
+    return from_tags(ctx.tags), net
+
+
+def test_a_later_hook_that_grows_more_than_was_saved_cancels_the_credit() -> None:
+    entries, net = _sequence(_Fold(), _AddBigTool(2_000))
+    assert net < 0
+    assert entries == []
+
+
+def test_a_later_partial_loss_caps_the_earlier_credit_at_the_net() -> None:
+    entries, net = _sequence(_Fold(), _AddBigTool(200))
+    assert net > 0
+    assert [(e["source"], e["tokens"]) for e in entries] == [("fold", net)]

@@ -89,6 +89,11 @@ class CompressTurn(Protocol):
     def count_messages(self, messages: list[dict[str, Any]], fallback: int) -> int:
         """Recount with the turn's own tokenizer; ``fallback`` on failure."""
 
+    # Optional, not part of the required protocol: a turn may expose
+    # ``tool_growth_tokens``, the tool-definition tokens ``transform`` ADDED to
+    # the request (a hook's search tool, say). The handler adds it to
+    # ``tokens_after``, since those tokens are sent too; absent reads as 0.
+
     def finish(
         self,
         *,

@@ -11110,6 +11110,9 @@ class OpenAIHandlerMixin:
 
             ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
 
+            # Tools a turn hook added are sent too: they reduce the saving.
+            if _turn is not None:
+                tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000
             _transforms_applied = list(result.transforms_applied or ())

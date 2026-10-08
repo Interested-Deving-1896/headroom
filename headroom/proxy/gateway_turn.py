@@ -839,6 +839,9 @@ class RequestTransformer:
         self.tags = tags
         self.caps = caps
         self.result: RequestTransformResult | None = None
+        # Tool-definition tokens the request hooks ADDED (e.g. a search tool).
+        # The compress handler adds it to ``tokens_after``: it is sent too.
+        self.tool_growth_tokens = 0
         self._tokenizer: Any = None
 
     def _get_tokenizer(self) -> Any:
@@ -914,6 +917,7 @@ class RequestTransformer:
                 messages_rewritten = True
             tools_after = _safe_count(count_tools, without_deferral_flags(tools))
             if tools_before is not None and tools_after is not None:
+                self.tool_growth_tokens = max(0, tools_after - tools_before)
                 saved = max(0, tools_before - tools_after)
                 if saved > 0:
                     self.tags["turn_hook_tools_saved_tokens"] = (
