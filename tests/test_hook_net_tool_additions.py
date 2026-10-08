@@ -253,3 +253,9 @@ def test_a_later_partial_loss_caps_the_earlier_credit_at_the_net() -> None:
     entries, net = _sequence(_Fold(), _AddBigTool(200))
     assert net > 0
     assert [(e["source"], e["tokens"]) for e in entries] == [("fold", net)]
+    (entry,) = entries
+    details = entry["details"]
+    # The breakdown sums to the credited amount; the raw deltas are kept.
+    assert details["message_tokens_saved"] + details["tool_tokens_saved"] == net
+    assert details["uncapped_message_tokens_saved"] > net
+    assert details["uncapped_tool_tokens_saved"] == 0

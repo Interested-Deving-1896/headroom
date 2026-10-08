@@ -263,6 +263,17 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
         if tokens <= 0:
             break
         budget -= tokens
+        if tokens < net_saved:
+            # Later hooks' cost comes off this credit; share it across the
+            # message and tool parts so the breakdown still sums to ``tokens``.
+            # The uncapped deltas stay for diagnosis.
+            message_part = round(details["message_tokens_saved"] * tokens / net_saved)
+            details = {
+                "message_tokens_saved": message_part,
+                "tool_tokens_saved": tokens - message_part,
+                "uncapped_message_tokens_saved": details["message_tokens_saved"],
+                "uncapped_tool_tokens_saved": details["tool_tokens_saved"],
+            }
         try:
             ctx.record_savings(source, tokens=tokens, details=details)
         except Exception:
