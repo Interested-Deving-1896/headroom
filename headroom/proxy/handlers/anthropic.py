@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from headroom.proxy.savings_calibration import CLIENT_REQUEST_TOKENS_TAG, local_request_tokens
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 
 if TYPE_CHECKING:
@@ -1314,6 +1315,13 @@ class AnthropicHandlerMixin:
             from headroom.proxy.savings_attribution import bind_scope
 
             bind_scope(tags, request.scope)
+            # The client's whole request, counted before Headroom touches it.
+            # Against the same count of the forwarded request this is the
+            # request's net saving (savings_calibration). Per-message cached:
+            # only messages new this turn are tokenized.
+            tags[CLIENT_REQUEST_TOKENS_TAG] = (
+                await asyncio.to_thread(local_request_tokens, model, body)
+            )[0]
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
@@ -3881,6 +3889,9 @@ class AnthropicHandlerMixin:
                             original_messages=next_original_messages,
                         )
 
+                        _cal_forwarded, _cal_full = await asyncio.to_thread(
+                            local_request_tokens, model, body
+                        )
                         await self._record_request_outcome(
                             RequestOutcome(
                                 request_id=request_id,
@@ -3894,6 +3905,9 @@ class AnthropicHandlerMixin:
                                 provider_input_tokens=(
                                     uncached_input_tokens + cr_tokens + cw_tokens
                                 ),
+                                calibration_key=getattr(prefix_tracker, "lineage_id", None),
+                                local_forwarded_tokens=_cal_forwarded,
+                                local_counts_full_request=_cal_full,
                                 cache_read_tokens=cr_tokens,
                                 cache_write_tokens=cw_tokens,
                                 cache_write_5m_tokens=cw_5m_tokens,
@@ -4116,6 +4130,8 @@ class AnthropicHandlerMixin:
                     for savings_tag in TOOL_SCHEMA_SAVINGS_TAGS:
                         tags.pop(savings_tag, None)
                     tags.pop("tool_search_deferred_tools", None)
+                    # The client's bytes go out unchanged: no net saving to book.
+                    tags.pop(CLIENT_REQUEST_TOKENS_TAG, None)
                     tags["wire_mutations_discarded"] = len(discarded_reasons)
                     tags["wire_mutation_reasons"] = ",".join(discarded_reasons)
 
@@ -5045,6 +5061,9 @@ class AnthropicHandlerMixin:
                         # that were showing 0% active-savings on non-
                         # streaming Anthropic traffic will now show the
                         # correct ratio.
+                        _cal_forwarded, _cal_full = await asyncio.to_thread(
+                            local_request_tokens, model, body
+                        )
                         await self._record_request_outcome(
                             RequestOutcome(
                                 request_id=request_id,
@@ -5056,6 +5075,9 @@ class AnthropicHandlerMixin:
                                 provider_input_tokens=(
                                     uncached_input_tokens + cr_tokens + cw_tokens
                                 ),
+                                calibration_key=getattr(prefix_tracker, "lineage_id", None),
+                                local_forwarded_tokens=_cal_forwarded,
+                                local_counts_full_request=_cal_full,
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,
                                 attempted_input_tokens=optimized_tokens + tokens_saved,
