@@ -26,6 +26,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+
 log = logging.getLogger(__name__)
 
 # Re-drive the model with a message list; returns the provider's response JSON.
@@ -209,7 +211,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
             if ctx.count_messages is not None:
                 before_messages = ctx.count_messages(ctx.messages)
             if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(ctx.tools)
+                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
             message_saved = (
                 max(0, before_messages - ctx.count_messages(ctx.messages))
@@ -217,7 +219,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 else 0
             )
             tool_saved = (
-                max(0, before_tools - ctx.count_tools(ctx.tools))
+                max(0, before_tools - ctx.count_tools(without_deferral_flags(ctx.tools)))
                 if before_tools is not None and ctx.count_tools is not None
                 else 0
             )

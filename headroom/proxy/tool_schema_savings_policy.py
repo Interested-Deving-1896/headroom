@@ -25,6 +25,29 @@ name to :data:`TOOL_SCHEMA_SAVINGS_TAGS` and every surface picks it up.
 
 from __future__ import annotations
 
+
+def without_deferral_flags(tools: object) -> object:
+    """The tool array as it is MEASURED for a hook's tool delta.
+
+    Deferral is reported through ``tool_search_deferred_tokens`` (it removes
+    schemas from the billed context while leaving them in the array, flagged
+    ``defer_loading``). Measuring the raw array would see only the flag
+    appear or disappear: un-deferring a tool would shorten the JSON by the
+    flag text and be booked as a small saving although the bill goes UP, and
+    deferring one would add a phantom cost. So the flag is ignored here, and a
+    hook's measured tool delta covers only real removals and rewrites. Never
+    mutates its input.
+    """
+    if not isinstance(tools, list):
+        return tools
+    return [
+        {k: v for k, v in tool.items() if k != "defer_loading"}
+        if isinstance(tool, dict) and "defer_loading" in tool
+        else tool
+        for tool in tools
+    ]
+
+
 TOOL_SCHEMA_SAVINGS_TAGS: tuple[str, ...] = (
     "tool_search_deferred_tokens",
     "turn_hook_tools_saved_tokens",
