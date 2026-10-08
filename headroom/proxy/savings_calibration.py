@@ -103,7 +103,11 @@ REMOVED_CONTENT_CORRECTION: dict[str, float] = {
     "claude-5": 0.89,
 }
 
-_CLAUDE_MAJOR = re.compile(r"claude-(?:(?:opus|sonnet|haiku|instant)-)?(\d+)")
+# Any tier name (opus, sonnet, haiku, fable, ...) followed by the major
+# version. Measured with count_tokens: every tier of a generation counts text
+# identically (Opus/Sonnet 4.6 and Haiku 4.5; Opus/Sonnet/Haiku 5.5 and
+# Fable 5.1), so the family is the generation, not the tier.
+_CLAUDE_MAJOR = re.compile(r"claude-(?:[a-z]+-)?(\d+)")
 
 
 # Tool definitions removed from a request (tool-search deferral, schema

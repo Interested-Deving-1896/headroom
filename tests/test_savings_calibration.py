@@ -55,6 +55,11 @@ def _cal(calibrator: SavingsCalibrator, **overrides):  # noqa: ANN003, ANN202
         ("anthropic.claude-sonnet-4-6-v1:0", "claude-4"),
         ("claude-opus-5-5", "claude-5"),
         ("claude-sonnet-5", "claude-5"),
+        ("claude-haiku-4-5", "claude-4"),
+        ("claude-opus-4-6", "claude-4"),
+        ("claude-haiku-5-5", "claude-5"),
+        ("claude-fable-5-1", "claude-5"),
+        ("us.anthropic.claude-fable-5-1-v1:0", "claude-5"),
         ("gpt-5", None),
     ],
 )
