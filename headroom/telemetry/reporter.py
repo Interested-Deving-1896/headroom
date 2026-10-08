@@ -326,18 +326,20 @@ class UsageReporter:
             "cache_read_tokens": provider_deltas["cache_read_tokens"],
             "cache_write_tokens": provider_deltas["cache_write_tokens"],
             "uncached_input_tokens": provider_deltas["uncached_input_tokens"],
-            # Savings in the provider's units (savings_calibration): the sum of
-            # per-request savings, and the novel part counted once per removal.
-            # *_added are requests where Headroom added more than it removed;
-            # the *_net fields are what Headroom actually saved.
-            "tokens_saved_provider": provider_deltas["tokens_saved_provider"],
-            "tokens_added_provider": provider_deltas["tokens_added_provider"],
-            "tokens_saved_provider_net": provider_deltas["tokens_saved_provider"]
+            # Savings in the provider's units (savings_calibration), NET: what
+            # Headroom saved minus what it added, the same meaning as /stats
+            # ``saved_provider``. ``*_novel_*`` counts each removal once, on the
+            # request it happened. ``*_gross`` / ``tokens_added_*`` are the two
+            # sides of the net, for auditing requests where Headroom added more
+            # than it removed.
+            "tokens_saved_provider": provider_deltas["tokens_saved_provider"]
             - provider_deltas["tokens_added_provider"],
-            "tokens_saved_novel_provider": provider_deltas["tokens_saved_novel_provider"],
-            "tokens_added_novel_provider": provider_deltas["tokens_added_novel_provider"],
-            "tokens_saved_novel_provider_net": provider_deltas["tokens_saved_novel_provider"]
+            "tokens_saved_provider_gross": provider_deltas["tokens_saved_provider"],
+            "tokens_added_provider": provider_deltas["tokens_added_provider"],
+            "tokens_saved_novel_provider": provider_deltas["tokens_saved_novel_provider"]
             - provider_deltas["tokens_added_novel_provider"],
+            "tokens_saved_novel_provider_gross": provider_deltas["tokens_saved_novel_provider"],
+            "tokens_added_novel_provider": provider_deltas["tokens_added_novel_provider"],
             # Units, stated so no consumer has to guess: tokens_after is billed
             # input where provider-reported; tokens_saved is Headroom's local
             # tokenizer count of what compression removed.

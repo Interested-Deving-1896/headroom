@@ -216,6 +216,7 @@ class SavingsCalibrator:
         tokens_saved: int,
         native_tokenizer: bool,
         tool_definition_tokens_saved: int = 0,
+        local_forwarded_tool_tokens: int = 0,
     ) -> CalibratedSavings:
         """Calibrate one request.
 
@@ -229,6 +230,9 @@ class SavingsCalibrator:
         ``tool_definition_tokens_saved``: the part of it that is the change in
         billed tool definitions (deferral and compaction minus tools Headroom
         added; may be negative). The rest is message content.
+        ``local_forwarded_tool_tokens``: the billed tool definitions within
+        ``local_forwarded_tokens``, used only to estimate the forwarded size
+        when the provider reported no usage.
         """
         billed = max(int(billed_input_tokens or 0), 0)
         local = max(int(local_forwarded_tokens or 0), 0)
@@ -292,11 +296,16 @@ class SavingsCalibrator:
 
         # Without provider usage the forwarded size is an estimate in provider
         # units (local count x the ratio in use), and the baseline says so.
+        # Tool definitions are estimated at the same rate their saving was
+        # converted at, so a tool Headroom added cannot push the baseline below
+        # the client's own request.
         if billed > 0:
             sent, estimated = billed, False
         else:
-            sent, estimated = round(local * (ratio or 1.0)), True
-        baseline = sent + total if sent > 0 else 0
+            fwd_tools = min(max(int(local_forwarded_tool_tokens or 0), 0), local)
+            sent = round((local - fwd_tools) * (ratio or 1.0) + fwd_tools * tool_rate)
+            estimated = True
+        baseline = max(sent + total, 0) if sent > 0 else 0
         return CalibratedSavings(
             factor=round(factor, 4),
             request_ratio=round(ratio, 4),

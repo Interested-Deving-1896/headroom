@@ -490,3 +490,39 @@ def test_extension_replaced_messages_are_the_starting_point(monkeypatch) -> None
     assert response.status_code == 200
     assert seen, "calibration did not run"
     assert seen[-1]["tokens_saved"] == 0
+
+
+def test_estimated_baseline_stays_positive_when_headroom_adds_a_tool() -> None:
+    # No usage, no prior ratio: a 1,000-local-token tool Headroom added to a
+    # 100-token client request. The baseline is the client's own request.
+    result = _cal(
+        SavingsCalibrator(),
+        billed_input_tokens=0,
+        local_forwarded_tokens=1_100,
+        local_forwarded_tool_tokens=1_000,
+        tokens_saved=-1_000,
+        tool_definition_tokens_saved=-1_000,
+    )
+    assert result.tokens_saved < 0
+    assert result.baseline_estimated is True
+    assert result.baseline_input_tokens == 100
+
+
+def test_licence_report_provider_savings_are_net() -> None:
+    from tests.test_provider_billed_input import _reporter_payload
+
+    cost = CostTracker()
+    cost.record_tokens(
+        "claude-sonnet-4-6", 0, 1_000, provider_tokens_saved=500, provider_novel_tokens_saved=500
+    )
+    cost.record_tokens(
+        "claude-sonnet-4-6", 0, 1_000, provider_tokens_saved=-120, provider_novel_tokens_saved=-120
+    )
+    payload = _reporter_payload(cost)
+    # Net, the same meaning as /stats saved_provider; gross and added audit it.
+    assert payload["tokens_saved_provider"] == 380
+    assert payload["tokens_saved_provider_gross"] == 500
+    assert payload["tokens_added_provider"] == 120
+    assert payload["tokens_saved_novel_provider"] == 380
+    assert payload["tokens_saved_novel_provider_gross"] == 500
+    assert payload["tokens_added_novel_provider"] == 120

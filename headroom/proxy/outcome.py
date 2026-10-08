@@ -789,6 +789,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tokens_saved=net_saved_local,
         native_tokenizer=_native_tokenizer(outcome.model),
         tool_definition_tokens_saved=tool_saved_local,
+        local_forwarded_tool_tokens=outcome.local_forwarded_tool_tokens,
     )
     calibrated_usd = _price_calibrated(outcome, calibrated)
 
