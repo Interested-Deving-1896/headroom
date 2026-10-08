@@ -211,8 +211,15 @@ class ContextTracker:
             and previous.workspace_key == workspace_key
             and previous.compression_created_at == compression_created_at
         ):
-            self._turn_order.remove(hash_key)
-            self._turn_order.append(hash_key)
+            # A replay preserves the event's age. Only an eligible event may
+            # gain eviction priority; otherwise stale history can crowd out
+            # context that the model can still proactively expand.
+            if (
+                time.time() - previous.timestamp <= self.config.max_context_age_seconds
+                and max(0, turn_number - previous.turn_number) <= self.config.max_turn_distance
+            ):
+                self._turn_order.remove(hash_key)
+                self._turn_order.append(hash_key)
             return
 
         context = CompressedContext(
