@@ -51,9 +51,11 @@ from dataclasses import dataclass
 
 __all__ = [
     "CLIENT_REQUEST_TOKENS_TAG",
+    "CLIENT_TOOL_TOKENS_TAG",
     "CalibratedSavings",
     "SavingsCalibrator",
     "get_savings_calibrator",
+    "local_request_counts",
     "local_request_overhead",
     "local_request_tokens",
     "removed_content_correction",
@@ -67,6 +69,9 @@ __all__ = [
 # deferral, minus anything Headroom added (its own tool definitions), each
 # counted exactly once regardless of which handler path ran.
 CLIENT_REQUEST_TOKENS_TAG = "_headroom_client_request_tokens"
+# Same, for the billed tool definitions alone, so the change in tools (deferral,
+# compaction, tools Headroom adds) is converted at the tool-definition rate.
+CLIENT_TOOL_TOKENS_TAG = "_headroom_client_tool_tokens"
 
 SOURCE_NATIVE = "native"
 SOURCE_REQUEST = "request"
@@ -156,20 +161,42 @@ class CalibratedSavings:
     # request (deferral/compaction), converted at TOOL_DEFINITION_RATE.
     tool_tokens_saved: int
     # What this request would have been without Headroom, in provider tokens:
-    # billed input plus the saving. 0 when the provider billed nothing.
+    # billed input (or its estimate, see baseline_estimated) plus the saving.
     baseline_input_tokens: int
+    # True when the provider reported no usage and the baseline is built from
+    # Headroom's own estimate of the forwarded request.
+    baseline_estimated: bool
     reduction_percent: float
 
 
 @dataclass
 class _Turn:
-    saved_local: int
-    saved_provider: int
+    # Previous request's savings per bucket, local and provider units.
+    message_local: int = 0
+    message_provider: int = 0
+    tool_local: int = 0
+    tool_provider: int = 0
+
+
+def _carry(current: int, prev_local: int, prev_provider: int, rate: float) -> tuple[int, int]:
+    """Split one bucket's saving into (carried, novel) provider tokens.
+
+    The part also present last request (same sign, up to its size) is carried
+    and keeps the provider value it was booked at; the rest is novel and is
+    converted at this request's rate. A bucket that first appears, grows, or
+    flips sign contributes novel tokens only for the change.
+    """
+    if prev_local and current and (current > 0) == (prev_local > 0):
+        overlap = min(abs(current), abs(prev_local)) * (1 if current > 0 else -1)
+        carried = round(prev_provider * overlap / prev_local)
+    else:
+        overlap, carried = 0, 0
+    return carried, round((current - overlap) * rate)
 
 
 class SavingsCalibrator:
-    """Per-request calibration. Keeps each conversation's previous turn (for the
-    novel/carried split) and each model's recent ratio (for unmeasurable
+    """Per-request calibration. Keeps each conversation's previous request (for
+    the novel/carried split) and each model's recent ratio (for unmeasurable
     requests)."""
 
     def __init__(self, max_conversations: int = MAX_CONVERSATIONS) -> None:
@@ -198,15 +225,16 @@ class SavingsCalibrator:
         ``local_covers_request``: that count includes the whole request (system
         prompt and tools, no images/documents), so billed/local is like for
         like. ``native_tokenizer``: the local tokenizer is the provider's own.
-        ``tokens_saved`` is the net local saving and may be negative.
-        ``tool_definition_tokens_saved`` is the part of it that is tool
-        definitions removed from the request (local units).
+        ``tokens_saved``: the net local saving (may be negative).
+        ``tool_definition_tokens_saved``: the part of it that is the change in
+        billed tool definitions (deferral and compaction minus tools Headroom
+        added; may be negative). The rest is message content.
         """
         billed = max(int(billed_input_tokens or 0), 0)
         local = max(int(local_forwarded_tokens or 0), 0)
         net = int(tokens_saved or 0)
-        tools_local = min(max(int(tool_definition_tokens_saved or 0), 0), max(net, 0))
-        saved = net - tools_local  # message content
+        tools_local = int(tool_definition_tokens_saved or 0)
+        message_local = net - tools_local
 
         with self._lock:
             ratio = 0.0
@@ -235,35 +263,40 @@ class SavingsCalibrator:
                 family = tokenizer_family(model)
                 tool_rate = TOOL_DEFINITION_RATE.get(family or "", ratio or 1.0)
 
-            # Carried = history compressed on an earlier turn and still smaller.
-            # It keeps the provider-unit value it had when it was removed; only
-            # this turn's novel removal is converted at this request's rate.
-            prev = self._turns.get(conversation_key) if conversation_key else None
-            if prev is not None and prev.saved_local > 0 and saved > 0:
-                carried_local = min(saved, prev.saved_local)
-                carried = round(prev.saved_provider * carried_local / prev.saved_local)
-            else:
-                carried_local, carried = 0, 0
-            novel = round((saved - carried_local) * factor)
-            # Removed tool definitions recur on every request. On a
-            # conversation's first request they are new input; afterwards they
-            # would have been part of the cached prefix, so they count as carried.
-            tools = round(tools_local * tool_rate)
-            if prev is not None:
-                carried += tools
-            else:
-                novel += tools
+            # Carried = removed on an earlier request and still removed (history
+            # compressed earlier, a tool deferred since an earlier turn). It
+            # would have been re-sent as cached prefix, so it is priced as cache
+            # reads; novel is what changed on this request.
+            prev = (self._turns.get(conversation_key) if conversation_key else None) or _Turn()
+            msg_carried, msg_novel = _carry(
+                message_local, prev.message_local, prev.message_provider, factor
+            )
+            tool_carried, tool_novel = _carry(
+                tools_local, prev.tool_local, prev.tool_provider, tool_rate
+            )
+            carried = msg_carried + tool_carried
+            novel = msg_novel + tool_novel
+            tools = tool_carried + tool_novel
             total = carried + novel
 
             if conversation_key:
                 self._turns[conversation_key] = _Turn(
-                    saved_local=saved, saved_provider=total - tools
+                    message_local=message_local,
+                    message_provider=msg_carried + msg_novel,
+                    tool_local=tools_local,
+                    tool_provider=tools,
                 )
                 self._turns.move_to_end(conversation_key)
                 while len(self._turns) > self._max_conversations:
                     self._turns.popitem(last=False)
 
-        baseline = billed + total if billed > 0 else 0
+        # Without provider usage the forwarded size is an estimate in provider
+        # units (local count x the ratio in use), and the baseline says so.
+        if billed > 0:
+            sent, estimated = billed, False
+        else:
+            sent, estimated = round(local * (ratio or 1.0)), True
+        baseline = sent + total if sent > 0 else 0
         return CalibratedSavings(
             factor=round(factor, 4),
             request_ratio=round(ratio, 4),
@@ -273,6 +306,7 @@ class SavingsCalibrator:
             carried_tokens_saved=carried,
             tool_tokens_saved=tools,
             baseline_input_tokens=baseline,
+            baseline_estimated=estimated,
             reduction_percent=round(total / baseline * 100, 2) if baseline > 0 else 0.0,
         )
 
@@ -325,53 +359,35 @@ def _has_media(messages: object) -> bool:
     return False
 
 
-def local_request_overhead(model: str, body: dict | None) -> tuple[int, bool]:
-    """Local count of the non-message parts of a request, and whether the full
-    request is locally countable.
-
-    Returns ``(system + tools tokens, covers_request)``. ``covers_request`` is
-    False when the messages carry images or documents, whose local counts are
-    rough estimates that would distort a whole-request ratio. The system
-    prompt and tool definitions are identical on every turn of an agent
-    session, so the count is cached by content and costs one tokenization per
-    distinct prefix, not one per request.
-    """
-    if not isinstance(body, dict):
-        return 0, False
-    covers = not _has_media(body.get("messages"))
-    parts = {k: body.get(k) for k in ("system", "tools") if body.get(k)}
-    tools = parts.get("tools")
-    if isinstance(tools, list):
-        # A deferred tool (``defer_loading``, tool search) is not billed until
-        # the model loads it, so it is not part of what the provider counted.
-        billed_tools = [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
-        if billed_tools:
-            parts["tools"] = billed_tools
-        else:
-            del parts["tools"]
-    if not parts:
-        return 0, covers
+def _count_json(model: str, value: object) -> int:
+    """Local tokens of a JSON-serialisable value, cached by content (system
+    prompts and tool lists repeat on every turn of a session)."""
     import hashlib
     import json
 
-    text = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     key = (model, hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest())
     with _overhead_lock:
         cached = _overhead_cache.get(key)
         if cached is not None:
             _overhead_cache.move_to_end(key)
-            return cached, covers
-    try:
-        from headroom.tokenizers import get_tokenizer
+            return cached
+    from headroom.tokenizers import get_tokenizer
 
-        tokens = int(get_tokenizer(model).count_text(text))
-    except Exception:  # pragma: no cover - never let accounting break a request
-        return 0, False
+    tokens = int(get_tokenizer(model).count_text(text))
     with _overhead_lock:
         _overhead_cache[key] = tokens
         while len(_overhead_cache) > _OVERHEAD_CACHE_MAX:
             _overhead_cache.popitem(last=False)
-    return tokens, covers
+    return tokens
+
+
+def _billed_tools(tools: object) -> list[object]:
+    # A deferred tool (``defer_loading``, tool search) is not billed until the
+    # model loads it, so it is not part of what the provider counted.
+    if not isinstance(tools, list):
+        return []
+    return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
 
 
 _message_cache: OrderedDict[tuple[str, str], int] = OrderedDict()
@@ -399,24 +415,49 @@ def _message_tokens(model: str, counter: object, message: object) -> int:
     return tokens
 
 
+def local_request_counts(model: str, body: dict | None) -> tuple[int, int, bool]:
+    """Headroom's local count of a whole request as the provider bills it.
+
+    Returns ``(total, tools, covers_request)``: system + billed tools +
+    messages; the billed tool definitions alone; and whether the count is like
+    for like with the provider's (False with images/documents, whose local
+    counts are rough). Counted the same way for the client's request and the
+    forwarded one, so their difference is the request's net saving and the
+    difference in ``tools`` is the tool-definition part of it.
+    """
+    if not isinstance(body, dict):
+        return 0, 0, False
+    covers = not _has_media(body.get("messages"))
+    try:
+        tools_list = _billed_tools(body.get("tools"))
+        tools = _count_json(model, tools_list) if tools_list else 0
+        system = body.get("system")
+        total = tools + (_count_json(model, system) if system else 0)
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            from headroom.tokenizers import get_tokenizer
+
+            counter = get_tokenizer(model)
+            total += int(counter.count_messages([]))
+            for message in messages:
+                total += _message_tokens(model, counter, message)
+    except Exception:  # pragma: no cover - never let accounting break a request
+        return 0, 0, False
+    return total, tools, covers
+
+
 def local_request_tokens(model: str, body: dict | None) -> tuple[int, bool]:
-    """Local count of the whole request (system + billed tools + messages),
-    and whether it is a like-for-like count of what the provider bills (False
-    with images/documents). Counted the same way for the client's request and
-    the forwarded one, so their difference is the request's net saving."""
-    overhead, covers = local_request_overhead(model, body)
+    """``(total, covers_request)`` from :func:`local_request_counts`."""
+    total, _tools, covers = local_request_counts(model, body)
+    return total, covers
+
+
+def local_request_overhead(model: str, body: dict | None) -> tuple[int, bool]:
+    """Local count of the non-message parts (system + billed tools), and
+    whether the request is like for like (see :func:`local_request_counts`)."""
     if not isinstance(body, dict):
         return 0, False
-    messages = body.get("messages")
-    if not isinstance(messages, list):
-        return overhead, covers
-    try:
-        from headroom.tokenizers import get_tokenizer
-
-        counter = get_tokenizer(model)
-        total = overhead + int(counter.count_messages([]))
-        for message in messages:
-            total += _message_tokens(model, counter, message)
-    except Exception:  # pragma: no cover - never let accounting break a request
-        return 0, False
-    return total, covers
+    total, _tools, covers = local_request_counts(
+        model, {"system": body.get("system"), "tools": body.get("tools")}
+    )
+    return total, covers and not _has_media(body.get("messages"))

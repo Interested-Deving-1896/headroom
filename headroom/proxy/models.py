@@ -117,6 +117,9 @@ class RequestLog:
     # Of which tool definitions removed (deferral/compaction).
     tool_tokens_saved_provider: int = 0
     baseline_input_tokens: int = 0
+    # True when the provider reported no usage: the baseline is built from
+    # Headroom's estimate of the forwarded request.
+    baseline_estimated: bool = False
     savings_percent_provider: float = 0.0
     calibration_factor: float = 1.0
     calibration_ratio: float = 0.0

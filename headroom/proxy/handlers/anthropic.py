@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from headroom.proxy.savings_calibration import CLIENT_REQUEST_TOKENS_TAG, local_request_tokens
+from headroom.proxy.savings_calibration import (
+    CLIENT_REQUEST_TOKENS_TAG,
+    CLIENT_TOOL_TOKENS_TAG,
+    local_request_counts,
+)
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 
 if TYPE_CHECKING:
@@ -1317,11 +1321,15 @@ class AnthropicHandlerMixin:
             bind_scope(tags, request.scope)
             # The client's whole request, counted before Headroom touches it.
             # Against the same count of the forwarded request this is the
-            # request's net saving (savings_calibration). Per-message cached:
-            # only messages new this turn are tokenized.
-            tags[CLIENT_REQUEST_TOKENS_TAG] = (
-                await asyncio.to_thread(local_request_tokens, model, body)
-            )[0]
+            # request's net saving (savings_calibration). Counts ``messages``
+            # (after any INPUT_RECEIVED extension replaced them, the same
+            # starting point as ``original_tokens``), not ``body["messages"]``.
+            # Per-message cached: only messages new this turn are tokenized.
+            _client_total, _client_tools, _ = await asyncio.to_thread(
+                local_request_counts, model, {**body, "messages": messages}
+            )
+            tags[CLIENT_REQUEST_TOKENS_TAG] = _client_total
+            tags[CLIENT_TOOL_TOKENS_TAG] = _client_tools
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
@@ -3889,8 +3897,8 @@ class AnthropicHandlerMixin:
                             original_messages=next_original_messages,
                         )
 
-                        _cal_forwarded, _cal_full = await asyncio.to_thread(
-                            local_request_tokens, model, body
+                        _cal_forwarded, _cal_tools, _cal_full = await asyncio.to_thread(
+                            local_request_counts, model, body
                         )
                         await self._record_request_outcome(
                             RequestOutcome(
@@ -3907,6 +3915,7 @@ class AnthropicHandlerMixin:
                                 ),
                                 calibration_key=getattr(prefix_tracker, "lineage_id", None),
                                 local_forwarded_tokens=_cal_forwarded,
+                                local_forwarded_tool_tokens=_cal_tools,
                                 local_counts_full_request=_cal_full,
                                 cache_read_tokens=cr_tokens,
                                 cache_write_tokens=cw_tokens,
@@ -4132,6 +4141,7 @@ class AnthropicHandlerMixin:
                     tags.pop("tool_search_deferred_tools", None)
                     # The client's bytes go out unchanged: no net saving to book.
                     tags.pop(CLIENT_REQUEST_TOKENS_TAG, None)
+                    tags.pop(CLIENT_TOOL_TOKENS_TAG, None)
                     tags["wire_mutations_discarded"] = len(discarded_reasons)
                     tags["wire_mutation_reasons"] = ",".join(discarded_reasons)
 
@@ -5061,8 +5071,8 @@ class AnthropicHandlerMixin:
                         # that were showing 0% active-savings on non-
                         # streaming Anthropic traffic will now show the
                         # correct ratio.
-                        _cal_forwarded, _cal_full = await asyncio.to_thread(
-                            local_request_tokens, model, body
+                        _cal_forwarded, _cal_tools, _cal_full = await asyncio.to_thread(
+                            local_request_counts, model, body
                         )
                         await self._record_request_outcome(
                             RequestOutcome(
@@ -5077,6 +5087,7 @@ class AnthropicHandlerMixin:
                                 ),
                                 calibration_key=getattr(prefix_tracker, "lineage_id", None),
                                 local_forwarded_tokens=_cal_forwarded,
+                                local_forwarded_tool_tokens=_cal_tools,
                                 local_counts_full_request=_cal_full,
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,

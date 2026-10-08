@@ -4829,6 +4829,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     },
                     "input_tokens_source": log.get("input_tokens_source"),
                     "calibration_source": log.get("calibration_source"),
+                    "baseline_estimated": bool(log.get("baseline_estimated")),
                 }
             )
         dashboard_recent_requests = dashboard_recent_requests[:25]
@@ -5188,6 +5189,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "saved_provider": m.tokens_saved_provider_total,
                 "saved_provider_novel": m.tokens_saved_provider_novel_total,
                 "saved_provider_carried": m.tokens_saved_provider_carried_total,
+                "added_provider": m.tokens_added_provider_total,
                 "saved_provider_usd": round(m.savings_usd_provider_total, 4),
                 "saved_provider_percent": round(
                     (

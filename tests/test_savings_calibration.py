@@ -98,7 +98,8 @@ def test_unmeasurable_request_uses_model_average_then_uncalibrated() -> None:
     first = _cal(calibrator, billed_input_tokens=0)
     assert first.source == SOURCE_UNCALIBRATED
     assert first.factor == 1.0
-    assert first.baseline_input_tokens == 0
+    assert first.baseline_estimated is True  # built from the local estimate
+    assert first.baseline_input_tokens == 100_000 + 10_000
 
     _cal(calibrator)  # a measurable request sets the model's ratio (1.6)
     # Images make the local count rough: never measured, average used.
@@ -330,3 +331,162 @@ def test_native_tokenizer_leaves_tool_savings_exact() -> None:
     )
     assert result.tokens_saved == 10_000
     assert result.tool_tokens_saved == 6_000
+
+
+# ── Devin review on #4055 ────────────────────────────────────────────────
+
+
+def test_tool_compaction_uses_the_tool_rate_not_the_message_rate() -> None:
+    from headroom.proxy.savings_calibration import TOOL_DEFINITION_RATE
+
+    # 1,000 local tokens of tool schema compacted, nothing deferred, no
+    # message compression: all of it is tool definitions.
+    result = _cal(SavingsCalibrator(), tokens_saved=1_000, tool_definition_tokens_saved=1_000)
+    assert result.tokens_saved == round(1_000 * TOOL_DEFINITION_RATE["claude-5"])
+    assert result.tool_tokens_saved == result.tokens_saved
+
+
+def test_tool_deferral_starting_mid_conversation_is_novel() -> None:
+    calibrator = SavingsCalibrator()
+    # Turn 1: tools forwarded normally, nothing saved.
+    _cal(calibrator, conversation_key="c", tokens_saved=0, tool_definition_tokens_saved=0)
+    # Turn 2: deferral starts. New this turn, so novel (priced as new input).
+    turn2 = _cal(
+        calibrator, conversation_key="c", tokens_saved=2_000, tool_definition_tokens_saved=2_000
+    )
+    assert turn2.carried_tokens_saved == 0
+    assert turn2.novel_tokens_saved == turn2.tokens_saved > 0
+    # Turn 3: the same deferral is now carried.
+    turn3 = _cal(
+        calibrator, conversation_key="c", tokens_saved=2_000, tool_definition_tokens_saved=2_000
+    )
+    assert turn3.novel_tokens_saved == 0
+    assert turn3.carried_tokens_saved == turn2.tokens_saved
+    # Turn 4: one more tool deferred: only the growth is novel.
+    turn4 = _cal(
+        calibrator, conversation_key="c", tokens_saved=2_500, tool_definition_tokens_saved=2_500
+    )
+    assert turn4.carried_tokens_saved == turn2.tokens_saved
+    assert turn4.novel_tokens_saved == turn4.tokens_saved - turn2.tokens_saved > 0
+
+
+def test_negative_savings_reach_the_licence_report() -> None:
+    from headroom.telemetry.reporter import UsageReporter
+
+    cost = CostTracker()
+    cost.record_tokens(
+        "claude-sonnet-4-6", 0, 1_000, provider_tokens_saved=500, provider_novel_tokens_saved=500
+    )
+    cost.record_tokens(
+        "claude-sonnet-4-6", 0, 1_000, provider_tokens_saved=-120, provider_novel_tokens_saved=-120
+    )
+    reporter = object.__new__(UsageReporter)
+    deltas = reporter._provider_counter_deltas(cost)
+    assert deltas["tokens_saved_provider"] == 500
+    assert deltas["tokens_added_provider"] == 120
+    assert deltas["tokens_added_novel_provider"] == 120
+
+
+def test_missing_provider_usage_gives_an_estimated_baseline() -> None:
+    result = _cal(
+        SavingsCalibrator(), billed_input_tokens=0, local_forwarded_tokens=1_000, tokens_saved=200
+    )
+    assert result.source == SOURCE_UNCALIBRATED
+    assert result.baseline_estimated is True
+    assert result.baseline_input_tokens == 1_200
+    assert result.reduction_percent == pytest.approx(200 / 1_200 * 100, abs=0.01)
+    measured = _cal(SavingsCalibrator())
+    assert measured.baseline_estimated is False
+
+
+def test_tool_count_follows_deferral_and_additions() -> None:
+    from headroom.proxy.savings_calibration import local_request_counts
+
+    model = "claude-sonnet-4-6"
+    big = {"name": "big", "description": "word " * 2_000, "input_schema": {"type": "object"}}
+    small = {"name": "headroom_retrieve", "description": "r", "input_schema": {"type": "object"}}
+    msgs = [{"role": "user", "content": "hi"}]
+    _, client_tools, _ = local_request_counts(model, {"tools": [big], "messages": msgs})
+    _, fwd_tools, _ = local_request_counts(
+        model, {"tools": [{**big, "defer_loading": True}, small], "messages": msgs}
+    )
+    assert client_tools > 1_900
+    assert 0 < fwd_tools < 100  # only the added tool is billed
+
+
+def test_extension_replaced_messages_are_the_starting_point(monkeypatch) -> None:  # noqa: ANN001
+    """An INPUT_RECEIVED extension that rewrites the messages is not Headroom
+    compression: the request's net saving must start from the rewritten
+    messages, exactly like ``original_tokens``."""
+    import dataclasses
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.config import TransformResult
+    from headroom.pipeline import PipelineStage
+    from headroom.proxy.savings_calibration import SavingsCalibrator as _Cal
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    short = [{"role": "user", "content": "hello"}]
+
+    class _Rewriter:
+        def on_pipeline_event(self, event):  # noqa: ANN001, ANN202
+            if event.stage is PipelineStage.INPUT_RECEIVED:
+                return dataclasses.replace(event, messages=list(short))
+            return None
+
+    seen: list[dict] = []
+    real = _Cal.calibrate
+
+    def spy(self, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        seen.append(kwargs)
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(_Cal, "calibrate", spy)
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        pipeline_extensions=[_Rewriter()],
+        discover_pipeline_extensions=False,
+    )
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        proxy.anthropic_pipeline = SimpleNamespace(
+            apply=lambda messages, model, **kwargs: TransformResult(
+                messages=messages, tokens_before=5, tokens_after=5, transforms_applied=[]
+            )
+        )
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN202
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 12, "output_tokens": 1},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "long client message " * 200}],
+            },
+        )
+    assert response.status_code == 200
+    assert seen, "calibration did not run"
+    assert seen[-1]["tokens_saved"] == 0

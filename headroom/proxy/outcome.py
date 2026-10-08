@@ -35,6 +35,7 @@ from typing import Any
 from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.savings_calibration import (
     CLIENT_REQUEST_TOKENS_TAG,
+    CLIENT_TOOL_TOKENS_TAG,
     CalibratedSavings,
     get_savings_calibrator,
 )
@@ -115,6 +116,8 @@ class RequestOutcome:
     #     what the provider bills (no images/documents).
     calibration_key: str | None = None
     local_forwarded_tokens: int = 0
+    # The billed tool definitions alone, same method (savings_calibration).
+    local_forwarded_tool_tokens: int = 0
     local_counts_full_request: bool = False
 
     # ── Cache (provider-agnostic; unused fields stay 0) ───────────────
@@ -357,6 +360,7 @@ class RequestOutcome:
         provider_input_tokens: int = 0,
         calibration_key: str | None = None,
         local_forwarded_tokens: int = 0,
+        local_forwarded_tool_tokens: int = 0,
         local_counts_full_request: bool = False,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
@@ -431,6 +435,7 @@ class RequestOutcome:
             provider_input_tokens=max(int(provider_input_tokens or 0), 0),
             calibration_key=calibration_key,
             local_forwarded_tokens=max(int(local_forwarded_tokens or 0), 0),
+            local_forwarded_tool_tokens=max(int(local_forwarded_tool_tokens or 0), 0),
             local_counts_full_request=local_counts_full_request,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
@@ -487,7 +492,7 @@ def _price_calibrated(outcome: RequestOutcome, calibrated: CalibratedSavings) ->
     carried savings sit in history the provider re-reads, so they are priced
     against the cached prefix. Never raises.
     """
-    if calibrated.tokens_saved <= 0:
+    if calibrated.novel_tokens_saved == 0 and calibrated.carried_tokens_saved == 0:
         return 0.0
     try:
         from headroom.pricing.counterfactual import CacheMix, Region, price_savings
@@ -505,9 +510,10 @@ def _price_calibrated(outcome: RequestOutcome, calibrated: CalibratedSavings) ->
             (calibrated.novel_tokens_saved, Region.LIVE_ZONE),
             (calibrated.carried_tokens_saved, Region.PREFIX),
         ):
-            if tokens > 0:
-                total += price_savings(
-                    tokens,
+            # Negative = tokens Headroom added; priced the same way, as a cost.
+            if tokens:
+                total += (1 if tokens > 0 else -1) * price_savings(
+                    abs(tokens),
                     model=outcome.model,
                     mix=mix,
                     region=region,
@@ -757,18 +763,22 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if not input_provider_reported and billed_input_tokens > 0:
         _warn_estimated_input(outcome.provider, outcome.model)
 
-    # This request's saving in the provider's units, from its own billed count
-    # (savings_calibration). ``tokens_saved`` is the per-request wire truth:
-    # how much smaller THIS request was than it would have been.
-    # Net saving from Headroom's own counts of the client's request and of the
-    # forwarded one (same method both sides). Paths that did not measure the
-    # client request fall back to the pipeline's message-level saving.
-    client_tokens = _int_tag((outcome.tags or {}).get(CLIENT_REQUEST_TOKENS_TAG))
+    # This request's saving in the provider's units (savings_calibration).
+    # Net saving = Headroom's local count of the client's request minus the
+    # same count of the forwarded one; its tool part = the same difference
+    # over billed tool definitions alone (deferral and compaction, minus tools
+    # Headroom added). Paths that did not measure the client request fall back
+    # to the pipeline's saving and the tool-savings tags.
+    tags_in = outcome.tags or {}
+    client_tokens = _int_tag(tags_in.get(CLIENT_REQUEST_TOKENS_TAG))
+    client_tools = _int_tag(tags_in.get(CLIENT_TOOL_TOKENS_TAG))
     forwarded_tokens = outcome.local_forwarded_tokens
     if client_tokens is not None and forwarded_tokens > 0:
         net_saved_local = client_tokens - forwarded_tokens
+        tool_saved_local = (client_tools or 0) - outcome.local_forwarded_tool_tokens
     else:
-        net_saved_local = headline_tokens_saved(outcome.tokens_saved, outcome.tags or {})
+        net_saved_local = headline_tokens_saved(outcome.tokens_saved, tags_in)
+        tool_saved_local = tool_schema_saved_from_tags(tags_in)
         forwarded_tokens = forwarded_tokens or outcome.optimized_tokens
     calibrated = get_savings_calibrator().calibrate(
         model=outcome.model,
@@ -778,7 +788,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         local_covers_request=outcome.local_counts_full_request,
         tokens_saved=net_saved_local,
         native_tokenizer=_native_tokenizer(outcome.model),
-        tool_definition_tokens_saved=tool_schema_saved_from_tags(outcome.tags or {}),
+        tool_definition_tokens_saved=tool_saved_local,
     )
     calibrated_usd = _price_calibrated(outcome, calibrated)
 
@@ -887,6 +897,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 carried_tokens_saved_provider=calibrated.carried_tokens_saved,
                 tool_tokens_saved_provider=calibrated.tool_tokens_saved,
                 baseline_input_tokens=calibrated.baseline_input_tokens,
+                baseline_estimated=calibrated.baseline_estimated,
                 savings_percent_provider=calibrated.reduction_percent,
                 calibration_factor=calibrated.factor,
                 calibration_ratio=calibrated.request_ratio,
