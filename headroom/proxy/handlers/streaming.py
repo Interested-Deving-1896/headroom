@@ -1327,12 +1327,14 @@ class StreamingMixin:
                                 for key, value in headers.items()
                                 if key.lower()
                                 not in {
+                                    "accept",
                                     "content-encoding",
                                     "transfer-encoding",
                                     "accept-encoding",
                                     "content-length",
                                 }
                             }
+                            continuation_headers["accept"] = "application/json"
                             continuation_response = await self._retry_request(
                                 "POST",
                                 url,
@@ -1342,6 +1344,11 @@ class StreamingMixin:
                                 forwarder_name="ccr_event_stream_continuation",
                                 path_for_log=url,
                             )
+                            if not 200 <= continuation_response.status_code < 300:
+                                raise RuntimeError(
+                                    "CCR continuation failed with HTTP "
+                                    f"{continuation_response.status_code}"
+                                )
                             return continuation_response.json()
 
                         if ccr_stream_provider == "anthropic":

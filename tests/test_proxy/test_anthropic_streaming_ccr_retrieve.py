@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,6 +20,92 @@ from starlette.requests import Request  # noqa: E402
 from headroom.cache.compression_store import get_compression_store  # noqa: E402
 from headroom.ccr.tool_injection import create_ccr_tool_definition  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+
+
+@contextmanager
+def _real_event_continuation(status=200, accept="text/event-stream"):
+    """Run the real forwarding/interception path, mocking only HTTP transports."""
+    config = _make_config()
+    config.ccr_event_streaming = True
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = app.state.proxy
+            key = get_compression_store().store('{"answer":"retained"}', "sample")
+            initial = _message_response(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "retrieve-1",
+                        "name": "headroom_retrieve",
+                        "input": {"hash": key},
+                    }
+                ],
+                stop_reason="tool_use",
+            )
+            events = proxy._response_to_sse(initial, "anthropic")
+
+            class UpstreamBytes(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    for event in events:
+                        yield event
+
+            async def transport(request):
+                return httpx.Response(
+                    200, headers={"content-type": "text/event-stream"}, stream=UpstreamBytes()
+                )
+
+            proxy.http_client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+            calls = []
+
+            async def continuation(method, url, headers, body, **kwargs):
+                calls.append((dict(headers), dict(body)))
+                payload = _message_response([{"type": "text", "text": "completed retrieval"}])
+                if status >= 400:
+                    payload = {
+                        "error": {"type": "invalid_request_error", "message": "failed continuation"}
+                    }
+                return httpx.Response(status, json=payload, request=httpx.Request(method, url))
+
+            proxy._retry_request = continuation
+            response = client.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                    "Accept": accept,
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 128,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": _buffered("retrieve context")}],
+                },
+            )
+            yield response, calls
+
+
+@pytest.mark.parametrize("accept", ["text/event-stream", "text/event-stream, application/json"])
+def test_real_event_continuation_requests_json(accept):
+    with _real_event_continuation(accept=accept) as (response, calls):
+        assert response.status_code == 200
+        assert len(calls) == 1
+        headers, body = calls[0]
+        assert body["stream"] is False
+        assert [(k.lower(), v) for k, v in headers.items() if k.lower() == "accept"] == [
+            ("accept", "application/json")
+        ]
+        assert "completed retrieval" in response.text
+
+
+@pytest.mark.parametrize("status", [400, 429, 503])
+def test_real_event_continuation_failure_emits_stream_error(status):
+    with _real_event_continuation(status=status) as (response, calls):
+        assert len(calls) == 1
+        assert "event: error" in response.text
+        assert "event: message_stop" not in response.text
+        assert "completed retrieval" not in response.text
 
 
 def _make_config() -> ProxyConfig:

@@ -36,6 +36,76 @@ def _stored_hash() -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("private_position", [0, 1])
+async def test_responses_hidden_retrieval_keeps_visible_output_indexes_contiguous(private_position):
+    key = _stored_hash()
+    private = {
+        "id": "private-retrieve",
+        "type": "function_call",
+        "name": "headroom_retrieve",
+        "call_id": "call-private",
+        "arguments": json.dumps({"hash": key}),
+        "status": "completed",
+    }
+
+    def message(item_id, text):
+        return {
+            "id": item_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+
+    initial_items = [message("initial-visible", "initial text")]
+    initial_items.insert(private_position, private)
+    initial = {
+        "id": "resp-initial",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-5",
+        "output": initial_items,
+    }
+
+    async def continuation(messages, tools):
+        return {
+            "id": "resp-final",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5",
+            "output": [message("final-visible", "continuation text")],
+        }
+
+    interceptor = EventLevelCCRInterceptor(
+        CCRResponseHandler(),
+        provider="openai_responses",
+        render_response=_openai_responses_to_sse,
+    )
+    chunks = [
+        chunk
+        async for chunk in interceptor.process(
+            _chunks(_openai_responses_to_sse(initial)),
+            [],
+            None,
+            continuation,
+        )
+    ]
+    events = [
+        json.loads(line[6:])
+        for chunk in chunks
+        for line in chunk.splitlines()
+        if line.startswith(b"data: ") and line != b"data: [DONE]"
+    ]
+    completed = next(event["response"] for event in events if event["type"] == "response.completed")
+    assert [item["id"] for item in completed["output"]] == ["initial-visible", "final-visible"]
+    for event in events:
+        if "output_index" in event:
+            item_id = event.get("item_id") or event.get("item", {}).get("id")
+            assert completed["output"][event["output_index"]]["id"] == item_id
+    assert {event["output_index"] for event in events if "output_index" in event} == {0, 1}
+
+
+@pytest.mark.asyncio
 async def test_anthropic_streams_long_text_then_splices_retrieval_continuation():
     hash_key = _stored_hash()
     upstream = [

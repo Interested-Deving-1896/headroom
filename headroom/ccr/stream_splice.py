@@ -117,6 +117,9 @@ class EventLevelCCRInterceptor:
                             detected_private = True
                             if item_id:
                                 private_item_ids.add(item_id)
+                            output_index = event.get("output_index")
+                            if isinstance(output_index, int):
+                                private_indexes.add(output_index)
                             continue
                         detected_client_tool = True
                     item_id = str(event.get("item_id") or "")
@@ -124,7 +127,14 @@ class EventLevelCCRInterceptor:
                         continue
                     output_index = event.get("output_index")
                     if isinstance(output_index, int):
-                        max_visible_index = max(max_visible_index, output_index)
+                        if output_index in private_indexes:
+                            continue
+                        visible_index = visible_indexes.setdefault(
+                            output_index, len(visible_indexes)
+                        )
+                        event["output_index"] = visible_index
+                        raw_event = _encode_sse_event(event)
+                        max_visible_index = max(max_visible_index, visible_index)
                     if event_type == "response.completed":
                         response = event.get("response")
                         if isinstance(response, dict):
