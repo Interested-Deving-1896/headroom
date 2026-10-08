@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +89,7 @@ class CompressedContext:
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
+    compression_created_at: float | None = None
 
 
 @dataclass
@@ -172,6 +174,7 @@ class ContextTracker:
         workspace_key: str,
         query_context: str = "",
         sample_content: str = "",
+        compression_created_at: float | None = None,
     ) -> None:
         """Track a compression event.
 
@@ -188,6 +191,8 @@ class ContextTracker:
                 explicitly exercise the no-scoping path.
             query_context: The user query when compression happened.
             sample_content: Sample of the content for relevance matching.
+            compression_created_at: Store event timestamp, allowing replayed
+                history markers to retain their original turn and wall-clock age.
         """
         if not self.config.enabled:
             return
@@ -199,16 +204,28 @@ class ContextTracker:
             )
             return
 
+        previous = self._contexts.get(hash_key)
+        if (
+            compression_created_at is not None
+            and previous is not None
+            and previous.workspace_key == workspace_key
+            and previous.compression_created_at == compression_created_at
+        ):
+            self._turn_order.remove(hash_key)
+            self._turn_order.append(hash_key)
+            return
+
         context = CompressedContext(
             hash_key=hash_key,
             turn_number=turn_number,
-            timestamp=time.time(),
+            timestamp=time.time() if compression_created_at is None else compression_created_at,
             tool_name=tool_name,
             original_item_count=original_count,
             compressed_item_count=compressed_count,
             query_context=query_context,
             sample_content=sample_content[:2000],  # Limit sample size
             workspace_key=workspace_key,
+            compression_created_at=compression_created_at,
         )
 
         # Add or update context
@@ -235,6 +252,7 @@ class ContextTracker:
         current_turn: int | None = None,
         *,
         workspace_key: str,
+        present_hashes: Collection[str] | None = None,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
 
@@ -249,6 +267,13 @@ class ContextTracker:
                 a workspace before invoking; the empty string short-
                 circuits to an empty result set rather than matching
                 empty-keyed test contexts to avoid accidental crossover.
+            present_hashes: CCR hashes whose markers appear in the request
+                being answered. When given, only those contexts may expand.
+                One workspace can serve several live conversations at once
+                (a Claude Code lead and its teammates share a cwd), and a
+                compression the requesting conversation never received is
+                another conversation's tool output, not context it lost
+                (#1174). ``None`` skips this filter.
 
         Returns:
             List of expansion recommendations, sorted by relevance.
@@ -280,6 +305,8 @@ class ContextTracker:
             # entries that belong to a different project than the one
             # the current request resolved to.
             if context.workspace_key != workspace_key:
+                continue
+            if present_hashes is not None and hash_key not in present_hashes:
                 continue
 
             # Check age
