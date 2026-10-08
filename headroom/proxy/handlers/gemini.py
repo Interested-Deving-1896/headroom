@@ -561,6 +561,8 @@ class GeminiHandlerMixin:
                         status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
+                        # Gemini's own promptTokenCount (inclusive of cached content).
+                        provider_input_tokens=total_input_tokens,
                         output_tokens=output_tokens,
                         tokens_saved=0,
                         attempted_input_tokens=total_input_tokens,
@@ -1044,6 +1046,8 @@ class GeminiHandlerMixin:
                     status_code=response.status_code,
                     original_tokens=effective_original_tokens,
                     optimized_tokens=total_input_tokens,
+                    # Gemini's own promptTokenCount (inclusive of cached content).
+                    provider_input_tokens=total_input_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     attempted_input_tokens=total_input_tokens + tokens_saved,
