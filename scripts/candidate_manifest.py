@@ -128,6 +128,11 @@ def _validate_rollout_identity(rollout: dict[str, Any]) -> dict[str, Any]:
 
 
 def inventory(args: argparse.Namespace) -> None:
+    """Atomically write a canonical inventory outside the payload directory.
+
+    Reject symlink payloads and output aliases so inventory generation cannot
+    change the files whose size and digest it records.
+    """
     directory = args.directory.resolve(strict=True)
     if not directory.is_dir():
         raise ValueError(f"runtime payload path is not a directory: {directory}")
@@ -154,6 +159,11 @@ def inventory(args: argparse.Namespace) -> None:
 
 
 def create(args: argparse.Namespace) -> None:
+    """Validate resolved provenance and atomically write a candidate manifest.
+
+    The output must not alias the artifact, rollout snapshot or runtime
+    inventory. Validation or replacement failure leaves input bytes intact.
+    """
     artifact = args.artifact.resolve(strict=True)
     inputs = [artifact, args.rollout]
     if args.runtime_payload:
@@ -199,6 +209,11 @@ def create(args: argparse.Namespace) -> None:
 
 
 def verify(args: argparse.Namespace) -> None:
+    """Validate exact candidate bytes and any supplied expected provenance.
+
+    Unsupported schemas and unsafe rollout identity fail closed. Artifact,
+    inventory or provenance mismatches raise ValueError without changing files.
+    """
     manifest = _load_json(args.manifest)
     _validator().validate(manifest)
     _validate_rollout_identity(manifest["rollout"])
@@ -243,6 +258,7 @@ def verify(args: argparse.Namespace) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
+    """Build the inventory, create and verify command-line interface."""
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
     payload = commands.add_parser("inventory")
@@ -285,6 +301,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Parse command arguments and run the selected maintenance operation."""
     args = parser().parse_args()
     args.handler(args)
 
