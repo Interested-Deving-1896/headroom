@@ -20,10 +20,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
-from headroom.proxy.tool_schema_savings_policy import (
-    reconcile_deferred_tokens,
-    without_deferral_flags,
-)
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -3394,8 +3391,6 @@ class AnthropicHandlerMixin:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                     )
-                # A hook may have un-deferred tools the built-in deferral booked.
-                reconcile_deferred_tokens(tags, body.get("tools"), _count_tool_tokens)
                 # Provider headers a hook asked for (``TurnContext.provider_headers``):
                 # allow-listed names only, ``anthropic-beta`` merged behind the
                 # client's own tokens — the same reduction the gateway contract

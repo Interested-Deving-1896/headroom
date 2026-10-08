@@ -25,6 +25,9 @@ name to :data:`TOOL_SCHEMA_SAVINGS_TAGS` and every surface picks it up.
 
 from __future__ import annotations
 
+import copy
+from typing import Any
+
 
 def without_deferral_flags(tools: object) -> object:
     """The tool array as it is MEASURED for a hook's tool delta.
@@ -48,31 +51,61 @@ def without_deferral_flags(tools: object) -> object:
     ]
 
 
-def reconcile_deferred_tokens(tags: object, tools: object, count_tools: object) -> None:
-    """Cap the deferral credit at what is still deferred after turn hooks.
+def deferred_booking(tags: object, tools: object) -> tuple[int, dict[str, Any]] | None:
+    """Snapshot the deferral currently booked: the tag and the tools it covers.
 
-    ``tool_search_deferred_tokens`` is booked when tools are flagged
-    ``defer_loading``. A hook that runs afterwards may un-defer some of them
-    (headroom-tool-search's hot tools); those are then billed, so the credit
-    must shrink with them. Re-measured with the same counter that booked it,
-    over the FINAL tool array, and only ever lowered: a hook that defers more
-    books its own tag. Never raises.
+    ``None`` when nothing is booked. The schemas are copied as they were when
+    booked, so a later in-place edit cannot change what the credit stands for.
     """
     if not isinstance(tags, dict) or "tool_search_deferred_tokens" not in tags:
-        return
+        return None
     try:
         booked = int(tags.get("tool_search_deferred_tokens") or 0)
-        still = (
-            [t for t in tools if isinstance(t, dict) and t.get("defer_loading")]
-            if isinstance(tools, list)
-            else []
-        )
-        measured = int(count_tools(still)) if still and callable(count_tools) else 0
-        if measured < booked:
-            tags["tool_search_deferred_tokens"] = measured
-            tags["tool_search_deferred_tools"] = min(
-                int(tags.get("tool_search_deferred_tools") or 0), len(still)
-            )
+    except (TypeError, ValueError):
+        return None
+    snapshot = {
+        str(t["name"]): copy.deepcopy(t)
+        for t in (tools if isinstance(tools, list) else [])
+        if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
+    }
+    return booked, snapshot
+
+
+def reconcile_deferred_tokens(
+    tags: object, booking: tuple[int, dict[str, Any]] | None, tools: object, count_tools: object
+) -> None:
+    """Cap the deferral credit at the booked tools still deferred after hooks.
+
+    A hook may un-defer tools the deferral booked (tool search's hot tools);
+    those are billed, so their share of the credit goes. The remaining share is
+    recounted from the BOOKED schemas, so a hook that grows another deferred
+    schema cannot keep an un-deferred tool's credit alive. Only ever lowers the
+    tag, and lowers the matching ``tool_search`` ledger entry by the same
+    amount so ``/stats`` by-source agrees with the headline. Never raises.
+    """
+    if booking is None or not isinstance(tags, dict) or not callable(count_tools):
+        return
+    booked, snapshot = booking
+    try:
+        still = {
+            str(t["name"])
+            for t in (tools if isinstance(tools, list) else [])
+            if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
+        }
+        kept = [schema for name, schema in snapshot.items() if name in still]
+        measured = int(count_tools(kept)) if kept else 0
+        released = booked - measured
+        if released <= 0:
+            return
+        tags["tool_search_deferred_tokens"] = measured
+        tags["tool_search_deferred_tools"] = len(kept)
+        from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+
+        ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
+        for item in reversed(ledger if isinstance(ledger, list) else []):
+            if isinstance(item, dict) and item.get("source") == "tool_search":
+                item["tokens"] = max(0, int(item.get("tokens") or 0) - released)
+                break
     except Exception:  # accounting must never break a request
         return
 

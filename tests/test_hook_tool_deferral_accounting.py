@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from headroom.proxy.savings_attribution import from_tags
+from headroom.proxy.savings_attribution import from_tags, record_savings
 from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.turn_hooks import (
     TurnContext,
@@ -112,28 +112,72 @@ def test_without_deferral_flags_never_mutates_and_passes_non_lists() -> None:
 # ── deferral credit is capped at what is still deferred after hooks ──────────
 
 
-def test_reconcile_lowers_the_credit_for_undeferred_tools() -> None:
-    from headroom.proxy.tool_schema_savings_policy import reconcile_deferred_tokens
+class _BookDeferral:
+    """Shaped like the native deferral hook: flags tools and books them."""
 
-    a, b = {**_tool("a"), "defer_loading": True}, {**_tool("b"), "defer_loading": True}
-    tags = {"tool_search_deferred_tokens": _count([a, b]), "tool_search_deferred_tools": 2}
-    b.pop("defer_loading")  # a hook un-defers b
-    reconcile_deferred_tokens(tags, [a, b], _count)
-    assert tags["tool_search_deferred_tokens"] == _count([a])
+    name = savings_source = "tool_search"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools = [{**t, "defer_loading": True} for t in ctx.tools]
+        ctx.tags["tool_search_deferred_tokens"] = _count(ctx.tools)
+        ctx.tags["tool_search_deferred_tools"] = len(ctx.tools)
+        record_savings(ctx.tags, "tool_search", tokens=_count(ctx.tools), estimated=True)
+
+
+class _UndeferFirstGrowSecond:
+    name = savings_source = "other"
+    stream_safe = True
+
+    def __init__(self, grow: int = 0) -> None:
+        self.grow = grow
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.tools[0].pop("defer_loading", None)
+        ctx.tools[1]["description"] += "g" * self.grow
+
+
+def _booked(*hooks: object) -> tuple[dict, list]:
+    for hook in hooks:
+        register_turn_hook(hook)
+    tags: dict = {}
+    ctx = TurnContext(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[_tool("a"), _tool("b")],
+        count_messages=_count,
+        count_tools=_count,
+        tags=tags,
+    )
+    run_request_hooks(ctx)
+    return tags, [e for e in from_tags(tags) if e["source"] == "tool_search"]
+
+
+def test_undeferring_a_booked_tool_lowers_the_headline_and_the_ledger() -> None:
+    tags, (entry,) = _booked(_BookDeferral(), _UndeferFirstGrowSecond())
+    expected = _count([{**_tool("b"), "defer_loading": True}])
+    assert tags["tool_search_deferred_tokens"] == expected
     assert tags["tool_search_deferred_tools"] == 1
+    assert entry["tokens"] == expected  # /stats by-source agrees with the headline
 
 
-def test_reconcile_never_raises_the_credit_or_invents_one() -> None:
-    from headroom.proxy.tool_schema_savings_policy import reconcile_deferred_tokens
+def test_growing_another_deferred_schema_cannot_keep_the_credit() -> None:
+    # b grows by far more than a's share: the final deferred set outweighs the
+    # booking, yet a is billed now, so its share must still go.
+    tags, (entry,) = _booked(_BookDeferral(), _UndeferFirstGrowSecond(grow=4_000))
+    expected = _count([{**_tool("b"), "defer_loading": True}])
+    assert tags["tool_search_deferred_tokens"] == expected
+    assert entry["tokens"] == expected
 
-    deferred = [{**_tool("a"), "defer_loading": True}, {**_tool("b"), "defer_loading": True}]
-    tags = {"tool_search_deferred_tokens": 5, "tool_search_deferred_tools": 1}
-    reconcile_deferred_tokens(tags, deferred, _count)
-    assert tags == {"tool_search_deferred_tokens": 5, "tool_search_deferred_tools": 1}
-    untouched: dict = {}
-    reconcile_deferred_tokens(untouched, deferred, _count)
-    assert untouched == {}
-    reconcile_deferred_tokens({"tool_search_deferred_tokens": 9}, None, None)  # no raise
+
+def test_reconcile_never_raises_the_credit_or_touches_unbooked_turns() -> None:
+    tags, (entry,) = _booked(_BookDeferral())
+    both = _count([{**_tool("a"), "defer_loading": True}, {**_tool("b"), "defer_loading": True}])
+    assert tags["tool_search_deferred_tokens"] == both == entry["tokens"]
+    clear_turn_hooks()
+    untouched, _ = _booked(_UndeferFirstGrowSecond())
+    assert "tool_search_deferred_tokens" not in untouched
 
 
 def test_anthropic_headline_drops_the_credit_of_a_tool_a_hook_undefers(monkeypatch) -> None:
@@ -219,3 +263,5 @@ def test_anthropic_headline_drops_the_credit_of_a_tool_a_hook_undefers(monkeypat
     tok = get_tokenizer("claude-sonnet-4-5")
     assert tags["tool_search_deferred_tools"] == 13
     assert tags["tool_search_deferred_tokens"] == tok.count_text(json.dumps(still, default=str))
+    (entry,) = [e for e in from_tags(tags) if e["source"] == "tool_search"]
+    assert entry["tokens"] == tags["tool_search_deferred_tokens"]
