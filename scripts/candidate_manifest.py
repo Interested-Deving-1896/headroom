@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,40 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def _safe_output(output: Path, inputs: list[Path], directory: Path | None = None) -> Path:
+    destination = output.resolve()
+    if directory is not None and destination.is_relative_to(directory):
+        raise ValueError("output must be outside the runtime payload directory")
+    for source in inputs:
+        if destination == source.resolve() or (
+            destination.exists() and destination.samefile(source)
+        ):
+            raise ValueError(f"output must not overwrite input: {source}")
+    return destination
+
+
+def _write_json_atomic(destination: Path, value: dict[str, Any]) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=destination.parent,
+            prefix=".candidate-output-",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _validator() -> Draft202012Validator:
@@ -95,11 +131,14 @@ def inventory(args: argparse.Namespace) -> None:
     directory = args.directory.resolve(strict=True)
     if not directory.is_dir():
         raise ValueError(f"runtime payload path is not a directory: {directory}")
+    _safe_output(args.output, [], directory)
+    sources: list[Path] = []
     files: list[dict[str, object]] = []
     for path in sorted(directory.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink():
             raise ValueError(f"runtime payload must not contain symlinks: {path}")
         if path.is_file():
+            sources.append(path)
             relative = path.relative_to(directory).as_posix()
             files.append(
                 {
@@ -110,19 +149,16 @@ def inventory(args: argparse.Namespace) -> None:
             )
     if not files:
         raise ValueError("runtime payload directory contains no files")
-    args.output.write_text(
-        json.dumps(
-            {"schema_version": 1, "files": files},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    destination = _safe_output(args.output, sources, directory)
+    _write_json_atomic(destination, {"schema_version": 1, "files": files})
 
 
 def create(args: argparse.Namespace) -> None:
     artifact = args.artifact.resolve(strict=True)
+    inputs = [artifact, args.rollout]
+    if args.runtime_payload:
+        inputs.append(args.runtime_payload)
+    destination = _safe_output(args.output, inputs)
     if not artifact.is_file() or artifact.stat().st_size < 1:
         raise ValueError(f"candidate artifact is not a non-empty file: {artifact}")
 
@@ -159,10 +195,7 @@ def create(args: argparse.Namespace) -> None:
             raise ValueError(f"runtime payload identity is not a non-empty file: {runtime_payload}")
         manifest["runtime_payload_sha256"] = _sha256(runtime_payload)
     _validator().validate(manifest)
-    args.output.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    _write_json_atomic(destination, manifest)
 
 
 def verify(args: argparse.Namespace) -> None:
