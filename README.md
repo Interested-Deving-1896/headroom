@@ -219,12 +219,12 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 <!-- AI:start:contributors -->
 | Contributor | Commits |
 |---|---|
-| [@chopratejas](https://github.com/chopratejas) | 1330 |
+| [@chopratejas](https://github.com/chopratejas) | 1332 |
 | [@JerrettDavis](https://github.com/JerrettDavis) | 380 |
 | [@abhay-codes07](https://github.com/abhay-codes07) | 180 |
-| [@gglucass](https://github.com/gglucass) | 164 |
+| [@gglucass](https://github.com/gglucass) | 165 |
 | [@rodboev](https://github.com/rodboev) | 106 |
-| [@dependabot[bot]](https://github.com/apps/dependabot) | 85 |
+| [@dependabot[bot]](https://github.com/apps/dependabot) | 93 |
 | [@Parideboy](https://github.com/Parideboy) | 67 |
 | [@adryanev](https://github.com/adryanev) | 35 |
 | [@MrAshRhodes](https://github.com/MrAshRhodes) | 31 |
@@ -233,21 +233,21 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 | [@DevanshiVyas](https://github.com/DevanshiVyas) | 22 |
 | [@lifeodyssey](https://github.com/lifeodyssey) | 21 |
 | [@axelray-dev](https://github.com/axelray-dev) | 19 |
-| [@trs-80](https://github.com/trs-80) | 16 |
 | [@aivinay](https://github.com/aivinay) | 16 |
+| [@trs-80](https://github.com/trs-80) | 16 |
 | [@Kayzo](https://github.com/Kayzo) | 15 |
+| [@KennethWKZ](https://github.com/KennethWKZ) | 14 |
 | [@dex0shubham](https://github.com/dex0shubham) | 14 |
 | [@tenderdeve](https://github.com/tenderdeve) | 14 |
+| [@oxura](https://github.com/oxura) | 14 |
 | [@lennney](https://github.com/lennney) | 13 |
 | [@rNoz](https://github.com/rNoz) | 12 |
-| [@oxura](https://github.com/oxura) | 12 |
-| [@Ayushraj06-bit](https://github.com/Ayushraj06-bit) | 11 |
-| [@ousamabenyounes](https://github.com/ousamabenyounes) | 11 |
+| [@Ayushraj06-bit](https://github.com/Ayushraj06-bit) | 12 |
 | [@Eyalm321](https://github.com/Eyalm321) | 11 |
-| [@KennethWKZ](https://github.com/KennethWKZ) | 11 |
+| [@ousamabenyounes](https://github.com/ousamabenyounes) | 11 |
 | [@mbachaud](https://github.com/mbachaud) | 11 |
-| [@lorenzozanee](https://github.com/lorenzozanee) | 10 |
-| [@pratikbin](https://github.com/pratikbin) | 10 |
+| [@lorenzozanee](https://github.com/lorenzozanee) | 11 |
+| [@superdiaodiao](https://github.com/superdiaodiao) | 10 |
 | [@neogenix](https://github.com/neogenix) | 10 |
 <!-- AI:end:contributors -->
 
